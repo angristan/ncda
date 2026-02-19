@@ -1,0 +1,170 @@
+use std::collections::HashSet;
+use std::time::Duration;
+
+use crate::bpf::{BpfEvent, FdPathCache};
+use crate::model::{FileTree, OpKind, SortBy};
+use crate::process::ProcessTable;
+use crate::rate::{EventLog, RateTracker};
+
+/// Shared state updated by the aggregator task, read by the TUI.
+pub struct AppState {
+    pub tree: FileTree,
+    pub fd_cache: FdPathCache,
+    pub process_table: ProcessTable,
+    pub event_log: EventLog,
+    pub global_rate: RateTracker,
+    pub total_events: u64,
+    pub dropped_events: u64,
+    /// Paths to exclude from tracking.
+    pub exclude_prefixes: Vec<String>,
+}
+
+impl AppState {
+    pub fn new(rate_window: Duration, exclude_prefixes: Vec<String>) -> Self {
+        Self {
+            tree: FileTree::new(),
+            fd_cache: FdPathCache::new(),
+            process_table: ProcessTable::new(),
+            event_log: EventLog::new(rate_window),
+            global_rate: RateTracker::new(rate_window),
+            total_events: 0,
+            dropped_events: 0,
+            exclude_prefixes,
+        }
+    }
+
+    /// Ingest a batch of BPF events into the state.
+    pub fn ingest(&mut self, events: Vec<BpfEvent>) {
+        for event in events {
+            self.total_events += 1;
+            match event {
+                BpfEvent::Open {
+                    pid,
+                    tid: _,
+                    fd,
+                    path,
+                } => {
+                    if self.is_excluded(&path) {
+                        continue;
+                    }
+                    self.fd_cache.on_open(pid, fd, path.clone());
+                    self.tree.record(&path, pid, OpKind::Open, 0, 0);
+                    self.process_table.record(pid, OpKind::Open, 0, 0);
+                }
+                BpfEvent::Read {
+                    pid,
+                    tid: _,
+                    fd,
+                    bytes,
+                    latency_ns,
+                } => {
+                    if let Some(path) = self.fd_cache.lookup(pid, fd) {
+                        let path = path.to_string();
+                        if self.is_excluded(&path) {
+                            continue;
+                        }
+                        self.tree
+                            .record(&path, pid, OpKind::Read, bytes, latency_ns);
+                        self.process_table
+                            .record(pid, OpKind::Read, bytes, latency_ns);
+                        self.global_rate.record(bytes);
+                        self.event_log.record(path, bytes);
+                    }
+                }
+                BpfEvent::Write {
+                    pid,
+                    tid: _,
+                    fd,
+                    bytes,
+                    latency_ns,
+                } => {
+                    if let Some(path) = self.fd_cache.lookup(pid, fd) {
+                        let path = path.to_string();
+                        if self.is_excluded(&path) {
+                            continue;
+                        }
+                        self.tree
+                            .record(&path, pid, OpKind::Write, bytes, latency_ns);
+                        self.process_table
+                            .record(pid, OpKind::Write, bytes, latency_ns);
+                        self.global_rate.record(bytes);
+                        self.event_log.record(path, bytes);
+                    }
+                }
+                BpfEvent::Close { pid, tid: _, fd } => {
+                    if let Some(path) = self.fd_cache.lookup(pid, fd) {
+                        let path = path.to_string();
+                        if !self.is_excluded(&path) {
+                            self.tree.record(&path, pid, OpKind::Close, 0, 0);
+                            self.process_table.record(pid, OpKind::Close, 0, 0);
+                        }
+                    }
+                    self.fd_cache.on_close(pid, fd);
+                }
+            }
+        }
+    }
+
+    fn is_excluded(&self, path: &str) -> bool {
+        self.exclude_prefixes
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+    }
+
+    pub fn reset(&mut self) {
+        self.tree.reset();
+        self.process_table.reset();
+        self.event_log.reset();
+        self.global_rate.reset();
+        self.total_events = 0;
+        self.dropped_events = 0;
+    }
+}
+
+/// View mode for the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Flat,
+    Tree,
+}
+
+/// TUI view state — not shared, owned by the render loop.
+#[allow(dead_code)]
+pub struct ViewState {
+    pub mode: ViewMode,
+    /// Current directory path components (flat mode navigation).
+    pub cwd: Vec<String>,
+    pub cursor: usize,
+    pub scroll_offset: usize,
+    /// Expanded paths in tree mode.
+    pub expanded: HashSet<Vec<String>>,
+    pub sort_by: SortBy,
+    pub sort_desc: bool,
+    pub show_processes: bool,
+    pub show_help: bool,
+}
+
+impl ViewState {
+    pub fn new() -> Self {
+        Self {
+            mode: ViewMode::Flat,
+            cwd: Vec::new(),
+            cursor: 0,
+            scroll_offset: 0,
+            expanded: HashSet::new(),
+            sort_by: SortBy::TotalBytes,
+            sort_desc: true,
+            show_processes: false,
+            show_help: false,
+        }
+    }
+
+    /// Full path string for the current directory.
+    pub fn cwd_path(&self) -> String {
+        if self.cwd.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", self.cwd.join("/"))
+        }
+    }
+}

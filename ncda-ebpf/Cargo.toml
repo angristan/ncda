@@ -1,0 +1,26 @@
+[package]
+name = "ncda-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ncda-common = { path = "../ncda-common" }
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "ncda"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 2
+debug = false
+overflow-checks = false
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true

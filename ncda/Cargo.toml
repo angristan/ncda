@@ -1,0 +1,36 @@
+[package]
+name = "ncda"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ncda-common = { path = "../ncda-common", features = ["user"] }
+
+anyhow = { workspace = true, default-features = true }
+aya = { workspace = true }
+aya-log = { workspace = true }
+clap = { workspace = true }
+env_logger = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "signal",
+    "sync",
+    "time",
+] }
+ratatui = "0.29"
+crossterm = "0.28"
+
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+cargo_metadata = { workspace = true }
+ncda-ebpf = { path = "../ncda-ebpf" }
+
+[[bin]]
+name = "ncda"
+path = "src/main.rs"
