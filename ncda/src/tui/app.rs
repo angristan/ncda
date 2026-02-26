@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::bpf::{BpfEvent, FdPathCache};
+use crate::container::ContainerResolver;
 use crate::model::{FileTree, OpKind, SortBy};
 use crate::process::ProcessTable;
 use crate::rate::{EventLog, RateTracker};
@@ -10,6 +11,7 @@ use crate::rate::{EventLog, RateTracker};
 pub struct AppState {
     pub tree: FileTree,
     pub fd_cache: FdPathCache,
+    pub containers: ContainerResolver,
     pub process_table: ProcessTable,
     pub event_log: EventLog,
     pub global_rate: RateTracker,
@@ -24,6 +26,7 @@ impl AppState {
         Self {
             tree: FileTree::new(),
             fd_cache: FdPathCache::new(),
+            containers: ContainerResolver::new(),
             process_table: ProcessTable::new(),
             event_log: EventLog::new(rate_window),
             global_rate: RateTracker::new(rate_window),
@@ -44,11 +47,28 @@ impl AppState {
                     fd,
                     path,
                 } => {
-                    if self.is_excluded(&path) {
+                    // Resolve the raw eBPF path via /proc/pid/fd/fd,
+                    // giving us the full absolute path even for relative
+                    // openat() calls and container processes.
+                    let mut resolved = self.fd_cache.resolve(pid, fd, &path);
+
+                    // Prefix with [container_name] for containerised processes
+                    // so they appear grouped in the tree.
+                    if let Some(name) = self.containers.resolve(pid) {
+                        if resolved.starts_with('/') {
+                            resolved = format!("[{name}]{resolved}");
+                        } else {
+                            resolved = format!("[{name}]/{resolved}");
+                        }
+                    }
+
+                    // Store the final path so Read/Write/Close reuse it.
+                    self.fd_cache.store(pid, fd, resolved.clone());
+
+                    if self.is_excluded(&resolved) {
                         continue;
                     }
-                    self.fd_cache.on_open(pid, fd, path.clone());
-                    self.tree.record(&path, pid, OpKind::Open, 0, 0);
+                    self.tree.record(&resolved, pid, OpKind::Open, 0, 0);
                     self.process_table.record(pid, OpKind::Open, 0, 0);
                 }
                 BpfEvent::Read {

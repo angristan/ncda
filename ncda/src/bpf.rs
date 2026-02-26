@@ -211,18 +211,35 @@ fn parse_io_event(data: &[u8], kind: u32) -> Option<BpfEvent> {
 
 /// Fd-to-path cache maintained in userspace.
 /// Maps (pid, fd) → path string.
+///
+/// When a file is opened, we resolve the raw eBPF-captured filename to the
+/// actual file path via `/proc/<pid>/fd/<fd>`. This handles relative paths
+/// from `openat(dirfd, "name", ...)` and gives full paths for container
+/// processes. For containers, the overlay prefix is stripped using
+/// `/proc/<pid>/root` so paths appear as the container sees them.
 pub struct FdPathCache {
     map: HashMap<(u32, u32), String>,
+    /// Cache of /proc/<pid>/root for container path resolution.
+    /// `None` means the process root is `/` (not containerised).
+    root_cache: HashMap<u32, Option<String>>,
 }
 
 impl FdPathCache {
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),
+            root_cache: HashMap::new(),
         }
     }
 
-    pub fn on_open(&mut self, pid: u32, fd: u32, path: String) {
+    /// Resolve the raw eBPF-captured path via procfs and return it.
+    /// Does **not** store the result — call [`store`] afterwards.
+    pub fn resolve(&mut self, pid: u32, fd: u32, raw_path: &str) -> String {
+        self.resolve_fd_path(pid, fd, raw_path)
+    }
+
+    /// Store the final (possibly container-prefixed) path for a pid/fd.
+    pub fn store(&mut self, pid: u32, fd: u32, path: String) {
         self.map.insert((pid, fd), path);
     }
 
@@ -236,5 +253,67 @@ impl FdPathCache {
 
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    /// Resolve the true file path for a given pid/fd via procfs.
+    /// Falls back to the raw eBPF-captured path if resolution fails.
+    fn resolve_fd_path(&mut self, pid: u32, fd: u32, raw_path: &str) -> String {
+        // Try readlink on /proc/pid/fd/fd to get the kernel-resolved path.
+        // This works even for relative openat(dirfd, name, ...) calls
+        // because the kernel has already resolved the path.
+        if let Ok(resolved) = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
+            if let Some(s) = resolved.to_str() {
+                // The kernel appends " (deleted)" for unlinked-but-open files
+                let s = s.trim_end_matches(" (deleted)");
+                // Only use absolute paths; skip pipes, sockets, anon_inode, etc.
+                if s.starts_with('/') {
+                    return self.strip_container_root(pid, s);
+                }
+            }
+        }
+
+        // If the raw path is already absolute, use it as-is
+        if raw_path.starts_with('/') {
+            return raw_path.to_string();
+        }
+
+        // For relative paths where /proc/pid/fd failed (fd already closed),
+        // try to prepend the process working directory
+        if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
+            if let Some(cwd_str) = cwd.to_str() {
+                let full_path = format!("{cwd_str}/{raw_path}");
+                return self.strip_container_root(pid, &full_path);
+            }
+        }
+
+        // Last resort: return the raw path as captured by eBPF
+        raw_path.to_string()
+    }
+
+    /// Strip the container's root filesystem prefix from a host-side path.
+    ///
+    /// For example, if `/proc/<pid>/root` points to
+    /// `/var/lib/docker/overlay2/<hash>/merged`, a host path of
+    /// `/var/lib/docker/overlay2/<hash>/merged/var/www/html/index.php`
+    /// becomes `/var/www/html/index.php`.
+    fn strip_container_root(&mut self, pid: u32, host_path: &str) -> String {
+        let root = self.root_cache.entry(pid).or_insert_with(|| {
+            std::fs::read_link(format!("/proc/{pid}/root"))
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .filter(|r| r != "/")
+        });
+
+        if let Some(root_str) = root {
+            if let Some(stripped) = host_path.strip_prefix(root_str.as_str()) {
+                return if stripped.is_empty() {
+                    "/".to_string()
+                } else {
+                    stripped.to_string()
+                };
+            }
+        }
+
+        host_path.to_string()
     }
 }
