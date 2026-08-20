@@ -28,7 +28,6 @@ crossterm = "0.28"
 anyhow = { workspace = true }
 aya-build = { workspace = true }
 cargo_metadata = { workspace = true }
-ncda-ebpf = { path = "../ncda-ebpf" }
 
 [[bin]]
 name = "ncda"

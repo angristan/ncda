@@ -13,13 +13,3 @@ which = { workspace = true }
 [[bin]]
 name = "ncda"
 path = "src/main.rs"
-
-[profile.dev]
-opt-level = 2
-debug = false
-overflow-checks = false
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-lto = true
