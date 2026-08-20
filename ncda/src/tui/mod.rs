@@ -116,27 +116,39 @@ fn draw(f: &mut ratatui::Frame, state: &AppState, view: &ViewState) {
 
     header::draw(f, chunks[0], view);
 
-    let main_area = if view.show_processes {
-        let h_chunks = Layout::default()
+    let (columns_area, main_area) = if view.show_processes {
+        // Split the complete table body so its header stays aligned with the
+        // main rows and the process panel can use the full body height.
+        let body_area = Rect::new(
+            chunks[1].x,
+            chunks[1].y,
+            chunks[1].width,
+            chunks[1].height.saturating_add(chunks[2].height),
+        );
+        let body_columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-            .split(chunks[2]);
+            .split(body_area);
+        let main_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(body_columns[0]);
 
-        draw_process_panel(f, h_chunks[1], state);
-        h_chunks[0]
+        draw_process_panel(f, body_columns[1], state);
+        (main_rows[0], main_rows[1])
     } else {
-        chunks[2]
+        (chunks[1], chunks[2])
     };
 
     match view.mode {
         ViewMode::Flat => {
-            flat_view::draw_columns(f, chunks[1]);
+            flat_view::draw_columns(f, columns_area);
             flat_view::draw(f, main_area, &state.tree, view, |prefix| {
                 state.event_log.rate_for_prefix(prefix)
             });
         }
         ViewMode::Tree => {
-            tree_view::draw_columns(f, chunks[1]);
+            tree_view::draw_columns(f, columns_area);
             let lines =
                 tree_view::flatten(&state.tree, &view.expanded, view.sort_by, view.sort_desc);
             tree_view::draw(f, main_area, &lines, view.cursor);
@@ -165,13 +177,18 @@ fn draw_process_panel(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     f.render_widget(block, area);
 
     let top = state.process_table.top_by_bytes(inner.height as usize);
+    let comm_width = process_name_width(inner.width);
     let items: Vec<Line> = top
         .iter()
         .map(|p| {
             Line::from(vec![
                 Span::styled(format!("{:>6} ", p.pid), Style::default().fg(Color::Yellow)),
                 Span::styled(
-                    format!("{:<12} ", truncate_str(&p.comm, 12)),
+                    format!(
+                        "{:<width$} ",
+                        truncate_str(&p.comm, comm_width),
+                        width = comm_width
+                    ),
                     Style::default().fg(Color::White),
                 ),
                 Span::styled(
@@ -238,10 +255,35 @@ fn draw_help_overlay(f: &mut ratatui::Frame) {
     f.render_widget(paragraph, popup_area);
 }
 
+fn process_name_width(area_width: u16) -> usize {
+    // PID, separators, and the read/write metrics consume 25 columns.
+    usize::from(area_width).saturating_sub(25).max(1)
+}
+
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let char_count = s.chars().count();
+    if char_count <= max {
         s.to_string()
+    } else if max > 1 {
+        let prefix: String = s.chars().take(max - 1).collect();
+        format!("{prefix}~")
     } else {
-        format!("{}~", &s[..max - 1])
+        "~".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_name_column_fills_wide_panels() {
+        let width = 60;
+        assert_eq!(25 + process_name_width(width), usize::from(width));
+    }
+
+    #[test]
+    fn process_name_truncation_is_unicode_safe() {
+        assert_eq!(truncate_str("téléchargement", 6), "téléc~");
     }
 }

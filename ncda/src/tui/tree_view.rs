@@ -9,6 +9,9 @@ use ratatui::Frame;
 use crate::model::{FileTree, SortBy, TreeNode};
 use crate::tui::footer::{format_bytes, format_count, format_latency};
 
+// Everything except the flexible tree-name column: graph and metrics.
+const FIXED_COLUMNS_WIDTH: usize = 44;
+
 /// A flattened tree line for rendering.
 pub struct TreeLine {
     pub depth: usize,
@@ -83,6 +86,8 @@ pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize) {
         return;
     }
 
+    let name_column_width = name_column_width(area.width);
+
     let max_bytes = lines
         .iter()
         .map(|l| l.total_bytes)
@@ -94,7 +99,8 @@ pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize) {
         .iter()
         .enumerate()
         .map(|(i, line)| {
-            let indent = "  ".repeat(line.depth);
+            let indent_width = (line.depth * 2).min(name_column_width.saturating_sub(3));
+            let indent = " ".repeat(indent_width);
             let icon = if line.is_dir {
                 if line.is_expanded {
                     "▾ "
@@ -126,7 +132,7 @@ pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize) {
                 Style::default()
             };
 
-            let max_name_width = 24usize.saturating_sub(line.depth * 2);
+            let max_name_width = name_column_width.saturating_sub(indent_width + 2).max(1);
 
             let spans = Line::from(vec![
                 Span::styled(indent, style),
@@ -143,7 +149,7 @@ pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize) {
                         Color::White
                     }),
                 ),
-                Span::raw(" "),
+                Span::styled(" ", style),
                 Span::styled(bar, style.fg(Color::Cyan)),
                 Span::styled(
                     format!(" R:{:>7}", format_bytes(line.read_bytes)),
@@ -163,7 +169,7 @@ pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize) {
                         style.fg(Color::White),
                     )
                 } else {
-                    Span::raw("")
+                    Span::styled(" ".repeat(8), style)
                 },
             ]);
 
@@ -180,29 +186,57 @@ pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize) {
 
 /// Draw column headers for tree view.
 pub fn draw_columns(f: &mut Frame, area: Rect) {
+    let name_column_width = name_column_width(area.width);
     let line = Line::from(vec![
         Span::styled(
-            format!("{:<26}", "  Name"),
+            format!("{:<width$}", "  Name", width = name_column_width),
             Style::default().add_modifier(Modifier::DIM),
         ),
         Span::styled(
-            format!("{:<8}", "Graph"),
+            format!(" {:<8}", "Graph"),
             Style::default().add_modifier(Modifier::DIM),
         ),
-        Span::styled("    Read ", Style::default().add_modifier(Modifier::DIM)),
-        Span::styled("   Write ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled("     Read ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled("    Write ", Style::default().add_modifier(Modifier::DIM)),
         Span::styled("    Ops", Style::default().add_modifier(Modifier::DIM)),
         Span::styled(" Latency", Style::default().add_modifier(Modifier::DIM)),
     ]);
     f.render_widget(ratatui::widgets::Paragraph::new(line), area);
 }
 
+fn name_column_width(area_width: u16) -> usize {
+    usize::from(area_width)
+        .saturating_sub(FIXED_COLUMNS_WIDTH)
+        .max(3)
+}
+
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let char_count = s.chars().count();
+    if char_count <= max {
         s.to_string()
     } else if max > 1 {
-        format!("{}~", &s[..max - 1])
+        let prefix: String = s.chars().take(max - 1).collect();
+        format!("{prefix}~")
     } else {
         "~".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flexible_name_column_fills_wide_areas() {
+        let width = 120;
+        let rendered_width = name_column_width(width) + 9 + 10 + 10 + 7 + 8;
+        assert_eq!(rendered_width, usize::from(width));
+    }
+
+    #[test]
+    fn deep_indentation_keeps_room_for_a_name() {
+        let column_width = name_column_width(80);
+        let indent_width = (100 * 2).min(column_width.saturating_sub(3));
+        assert!(column_width.saturating_sub(indent_width + 2) >= 1);
     }
 }
