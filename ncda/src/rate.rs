@@ -1,6 +1,9 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::process::ProcessTable;
+use crate::tui::filter::FilterQuery;
+
 /// Computes rolling bytes/sec over a sliding time window.
 pub struct RateTracker {
     window: Duration,
@@ -91,13 +94,26 @@ impl EventLog {
         self.expire(now);
     }
 
-    pub fn rate_for_prefix(&self, prefix: &str) -> f64 {
+    pub fn rate_for_prefix(
+        &self,
+        prefix: &str,
+        filter: &FilterQuery,
+        processes: &ProcessTable,
+    ) -> f64 {
         let now = Instant::now();
         let cutoff = now.checked_sub(self.window).unwrap_or(now);
         let total_bytes: u64 = self
             .events
             .iter()
-            .filter(|event| event.timestamp >= cutoff && path_matches_prefix(&event.path, prefix))
+            .filter(|event| {
+                event.timestamp >= cutoff
+                    && path_matches_prefix(&event.path, prefix)
+                    && filter.matches_activity(
+                        &event.path,
+                        event.pid,
+                        processes.processes.get(&event.pid),
+                    )
+            })
             .map(|event| event.bytes)
             .sum();
         let elapsed = self.window.as_secs_f64();
@@ -108,9 +124,20 @@ impl EventLog {
         }
     }
 
-    pub fn sparkline_for_prefix(&self, prefix: &str, buckets: usize) -> Vec<u64> {
+    pub fn sparkline_for_prefix(
+        &self,
+        prefix: &str,
+        buckets: usize,
+        filter: &FilterQuery,
+        processes: &ProcessTable,
+    ) -> Vec<u64> {
         self.bucketize(buckets, Instant::now(), |event| {
             path_matches_prefix(&event.path, prefix)
+                && filter.matches_activity(
+                    &event.path,
+                    event.pid,
+                    processes.processes.get(&event.pid),
+                )
         })
     }
 
@@ -183,9 +210,30 @@ mod tests {
         let mut log = EventLog::new(Duration::from_secs(5));
         log.record("/a".to_string(), 7, 11);
         log.record("/a/b".to_string(), 7, 13);
-        let buckets = log.sparkline_for_prefix("/a", 8);
+        let filter = FilterQuery::default();
+        let processes = ProcessTable::new();
+        let buckets = log.sparkline_for_prefix("/a", 8, &filter, &processes);
         assert_eq!(buckets.iter().sum::<u64>(), 24);
         assert_eq!(log.sparkline_for_pid(7, 8).iter().sum::<u64>(), 24);
+    }
+
+    #[test]
+    fn histories_respect_pid_filters() {
+        let mut log = EventLog::new(Duration::from_secs(5));
+        log.record("/a".to_string(), 7, 11);
+        log.record("/a".to_string(), 8, 13);
+        let mut processes = ProcessTable::new();
+        processes.record(7, crate::model::OpKind::Read, 11, 1);
+        processes.record(8, crate::model::OpKind::Read, 13, 1);
+        let filter = FilterQuery::parse("pid:7").unwrap();
+
+        assert_eq!(log.rate_for_prefix("/a", &filter, &processes), 2.2);
+        assert_eq!(
+            log.sparkline_for_prefix("/a", 8, &filter, &processes)
+                .iter()
+                .sum::<u64>(),
+            11
+        );
     }
 
     #[test]
@@ -195,7 +243,11 @@ mod tests {
         assert_eq!(tracker.rate_bps(), 0.0);
         let mut log = EventLog::new(Duration::ZERO);
         log.record("/a".to_string(), 1, 10);
-        assert_eq!(log.rate_for_prefix("/a"), 0.0);
-        assert!(log.sparkline_for_prefix("/a", 8).is_empty());
+        let filter = FilterQuery::default();
+        let processes = ProcessTable::new();
+        assert_eq!(log.rate_for_prefix("/a", &filter, &processes), 0.0);
+        assert!(log
+            .sparkline_for_prefix("/a", 8, &filter, &processes)
+            .is_empty());
     }
 }

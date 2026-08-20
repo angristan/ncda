@@ -111,7 +111,7 @@ pub fn draw(
             } else {
                 row.name.clone()
             };
-            let rate = event_log.rate_for_prefix(&row.path);
+            let rate = event_log.rate_for_prefix(&row.path, &view.filter, processes);
             let rate_str = if rate > 0.0 {
                 format!("{}/s", format_bytes_raw(rate as u64))
             } else {
@@ -137,7 +137,8 @@ pub fn draw(
             ];
             match columns.profile {
                 WidthProfile::Full => {
-                    let history = event_log.sparkline_for_prefix(&row.path, 8);
+                    let history =
+                        event_log.sparkline_for_prefix(&row.path, 8, &view.filter, processes);
                     spans.extend([
                         Span::styled(
                             activity_cell(
@@ -165,7 +166,8 @@ pub fn draw(
                     ]);
                 }
                 WidthProfile::Compact => {
-                    let history = event_log.sparkline_for_prefix(&row.path, 8);
+                    let history =
+                        event_log.sparkline_for_prefix(&row.path, 8, &view.filter, processes);
                     spans.extend([
                         Span::styled(
                             activity_cell(

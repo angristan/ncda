@@ -112,7 +112,15 @@ fn flatten_recurse(
     }
 }
 
-pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize, event_log: &EventLog) {
+pub fn draw(
+    f: &mut Frame,
+    area: Rect,
+    lines: &[TreeLine],
+    cursor: usize,
+    event_log: &EventLog,
+    filter: &FilterQuery,
+    processes: &ProcessTable,
+) {
     if lines.is_empty() {
         f.render_widget(
             List::new(vec![ListItem::new("  (no activity matches)")])
@@ -157,7 +165,7 @@ pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize, event_
             } else {
                 Style::default()
             };
-            let rate = event_log.rate_for_prefix(&line.display_path);
+            let rate = event_log.rate_for_prefix(&line.display_path, filter, processes);
             let rate_str = if rate > 0.0 {
                 format!("{}/s", format_bytes_raw(rate as u64))
             } else {
@@ -177,7 +185,8 @@ pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize, event_
             ];
             match columns.profile {
                 WidthProfile::Full => {
-                    let history = event_log.sparkline_for_prefix(&line.display_path, 8);
+                    let history =
+                        event_log.sparkline_for_prefix(&line.display_path, 8, filter, processes);
                     spans.extend([
                         Span::styled(
                             activity_cell(line.total_bytes, max_bytes, &history, columns.graph),
@@ -200,7 +209,8 @@ pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize, event_
                     ]);
                 }
                 WidthProfile::Compact => {
-                    let history = event_log.sparkline_for_prefix(&line.display_path, 8);
+                    let history =
+                        event_log.sparkline_for_prefix(&line.display_path, 8, filter, processes);
                     spans.extend([
                         Span::styled(
                             activity_cell(line.total_bytes, max_bytes, &history, columns.graph),

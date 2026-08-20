@@ -1,4 +1,6 @@
-use crate::model::{NodeStats, TreeNode};
+use std::collections::HashSet;
+
+use crate::model::{FileTree, NodeStats, TreeNode};
 use crate::process::{ProcessInfo, ProcessTable};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,11 +56,7 @@ impl FilterQuery {
         &self.raw
     }
 
-    pub fn matches_process(&self, process: &ProcessInfo) -> bool {
-        self.matches("", process.pid, Some(process))
-    }
-
-    fn matches(&self, path: &str, pid: u32, process: Option<&ProcessInfo>) -> bool {
+    pub fn matches_activity(&self, path: &str, pid: u32, process: Option<&ProcessInfo>) -> bool {
         if self.is_empty() {
             return true;
         }
@@ -103,7 +101,7 @@ pub fn filtered_stats(
 
     let mut total = NodeStats::default();
     for (pid, stats) in &node.per_process {
-        if query.matches(path, *pid, processes.processes.get(pid)) {
+        if query.matches_activity(path, *pid, processes.processes.get(pid)) {
             total.accumulate(stats);
         }
     }
@@ -116,6 +114,37 @@ pub fn filtered_stats(
     }
 
     (total.total_ops() > 0).then_some(total)
+}
+
+pub fn matching_pids(
+    tree: &FileTree,
+    query: &FilterQuery,
+    processes: &ProcessTable,
+) -> HashSet<u32> {
+    fn visit(
+        node: &TreeNode,
+        path: &str,
+        query: &FilterQuery,
+        processes: &ProcessTable,
+        matching: &mut HashSet<u32>,
+    ) {
+        for pid in node.per_process.keys() {
+            if query.matches_activity(path, *pid, processes.processes.get(pid)) {
+                matching.insert(*pid);
+            }
+        }
+        for child in node.children.values() {
+            let child_path = join_path(path, &child.name);
+            visit(child, &child_path, query, processes, matching);
+        }
+    }
+
+    if query.is_empty() {
+        return processes.processes.keys().copied().collect();
+    }
+    let mut matching = HashSet::new();
+    visit(&tree.root, "/", query, processes, &mut matching);
+    matching
 }
 
 pub fn join_path(parent: &str, child: &str) -> String {
@@ -149,8 +178,8 @@ mod tests {
             container: Some("database".to_string()),
             stats: NodeStats::default(),
         };
-        assert!(query.matches("/var/log/db", 42, Some(&process)));
-        assert!(!query.matches("/var/lib/db", 42, Some(&process)));
+        assert!(query.matches_activity("/var/log/db", 42, Some(&process)));
+        assert!(!query.matches_activity("/var/lib/db", 42, Some(&process)));
     }
 
     #[test]
@@ -170,5 +199,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stats.read_bytes, 7);
+
+        let pids = matching_pids(
+            &tree,
+            &FilterQuery::parse("path:/var/b").unwrap(),
+            &processes,
+        );
+        assert_eq!(pids, HashSet::from([20]));
     }
 }

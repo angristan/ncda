@@ -198,7 +198,15 @@ fn draw(f: &mut ratatui::Frame, state: &AppState, view: &ViewState) {
                 &view.filter,
                 &state.process_table,
             );
-            tree_view::draw(f, main_area, &lines, view.cursor, &state.event_log);
+            tree_view::draw(
+                f,
+                main_area,
+                &lines,
+                view.cursor,
+                &state.event_log,
+                &view.filter,
+                &state.process_table,
+            );
         }
     }
 
@@ -277,11 +285,12 @@ fn visible_processes<'a>(
     state: &'a AppState,
     view: &ViewState,
 ) -> Vec<&'a crate::process::ProcessInfo> {
+    let matching = filter::matching_pids(&state.tree, &view.filter, &state.process_table);
     state
         .process_table
         .sorted(view.process_sort, view.process_sort_desc)
         .into_iter()
-        .filter(|process| view.filter.matches_process(process))
+        .filter(|process| matching.contains(&process.pid))
         .collect()
 }
 
