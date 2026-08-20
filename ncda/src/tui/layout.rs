@@ -1,4 +1,4 @@
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Modifier};
 use ratatui::text::Span;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -56,12 +56,22 @@ impl TableColumns {
 }
 
 pub fn highlight_selected(spans: &mut [Span<'_>]) {
-    let style = Style::default()
-        .fg(Color::White)
-        .bg(Color::Rgb(45, 55, 72))
-        .add_modifier(Modifier::BOLD);
     for span in spans {
-        span.style = style;
+        let foreground = match span.style.fg {
+            Some(Color::Black | Color::DarkGray | Color::Gray) | None => Color::White,
+            Some(Color::Red) => Color::LightRed,
+            Some(Color::Green) => Color::LightGreen,
+            Some(Color::Yellow) => Color::LightYellow,
+            Some(Color::Blue) => Color::LightBlue,
+            Some(Color::Magenta) => Color::LightMagenta,
+            Some(Color::Cyan) => Color::LightCyan,
+            Some(color) => color,
+        };
+        span.style = span
+            .style
+            .fg(foreground)
+            .bg(Color::Rgb(45, 55, 72))
+            .add_modifier(Modifier::BOLD);
     }
 }
 
@@ -114,6 +124,8 @@ pub fn fit_display(value: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::style::Style;
+
     use super::*;
 
     #[test]
@@ -134,18 +146,21 @@ mod tests {
     }
 
     #[test]
-    fn selection_overrides_low_contrast_cell_colors() {
+    fn selection_brightens_semantic_cell_colors() {
         let mut spans = [
             Span::styled("name", Style::default().fg(Color::Blue)),
             Span::styled("metric", Style::default().fg(Color::Red)),
+            Span::raw("separator"),
         ];
         highlight_selected(&mut spans);
 
-        let expected = Style::default()
-            .fg(Color::White)
-            .bg(Color::Rgb(45, 55, 72))
-            .add_modifier(Modifier::BOLD);
-        assert!(spans.iter().all(|span| span.style == expected));
+        assert_eq!(spans[0].style.fg, Some(Color::LightBlue));
+        assert_eq!(spans[1].style.fg, Some(Color::LightRed));
+        assert_eq!(spans[2].style.fg, Some(Color::White));
+        assert!(spans.iter().all(|span| {
+            span.style.bg == Some(Color::Rgb(45, 55, 72))
+                && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
     }
 
     #[test]
