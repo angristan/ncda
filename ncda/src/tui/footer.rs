@@ -14,34 +14,54 @@ pub fn draw(
     total_events: u64,
     dropped_events: u64,
 ) {
-    let line = Line::from(vec![
-        Span::styled(" R:", Style::default().fg(Color::Cyan)),
-        Span::raw(format_bytes(root_stats.read_bytes)),
-        Span::styled(" W:", Style::default().fg(Color::Red)),
-        Span::raw(format_bytes(root_stats.write_bytes)),
-        Span::raw(" | "),
-        Span::styled("Ops:", Style::default().fg(Color::Yellow)),
-        Span::raw(format_count(root_stats.total_ops())),
-        Span::raw(" | "),
-        Span::styled("Rate:", Style::default().fg(Color::Green)),
-        Span::raw(format!("{}/s", format_bytes_raw(rate_bps as u64))),
-        Span::raw(" | "),
-        Span::raw(format!("Evts:{}", format_count(total_events))),
-        Span::raw(" | "),
-        Span::styled(
-            format!("Drop:{}", format_count(dropped_events)),
-            Style::default().fg(if dropped_events == 0 {
-                Color::DarkGray
+    let drop_style = Style::default().fg(if dropped_events == 0 {
+        Color::DarkGray
+    } else {
+        Color::Red
+    });
+    let line = if area.width < 60 {
+        Line::from(vec![
+            Span::styled(" R:", Style::default().fg(Color::Cyan)),
+            Span::raw(format_bytes(root_stats.read_bytes)),
+            Span::styled(" W:", Style::default().fg(Color::Red)),
+            Span::raw(format_bytes(root_stats.write_bytes)),
+            Span::styled(" @", Style::default().fg(Color::Green)),
+            Span::raw(format!("{}/s", format_bytes_raw(rate_bps as u64))),
+            Span::styled(format!(" D:{}", format_count(dropped_events)), drop_style),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" R:", Style::default().fg(Color::Cyan)),
+            Span::raw(format_bytes(root_stats.read_bytes)),
+            Span::styled(" W:", Style::default().fg(Color::Red)),
+            Span::raw(format_bytes(root_stats.write_bytes)),
+            Span::raw(" | "),
+            Span::styled("Ops:", Style::default().fg(Color::Yellow)),
+            Span::raw(format_count(root_stats.total_ops())),
+            Span::raw(" | "),
+            Span::styled("Rate:", Style::default().fg(Color::Green)),
+            Span::raw(format!("{}/s", format_bytes_raw(rate_bps as u64))),
+            Span::raw(" | "),
+            Span::raw(format!("Evts:{}", format_count(total_events))),
+            Span::raw(" | "),
+            Span::styled(format!("Drop:{}", format_count(dropped_events)), drop_style),
+            if area.width >= 90 {
+                Span::raw(" | ")
             } else {
-                Color::Red
-            }),
-        ),
-        Span::raw(" | "),
-        Span::styled("q", Style::default().fg(Color::Yellow)),
-        Span::raw(":quit "),
-        Span::styled("?", Style::default().fg(Color::Yellow)),
-        Span::raw(":help"),
-    ]);
+                Span::raw("")
+            },
+            if area.width >= 90 {
+                Span::styled("q", Style::default().fg(Color::Yellow))
+            } else {
+                Span::raw("")
+            },
+            if area.width >= 90 {
+                Span::raw(":quit ?:help")
+            } else {
+                Span::raw("")
+            },
+        ])
+    };
 
     let paragraph = Paragraph::new(line);
     f.render_widget(paragraph, area);

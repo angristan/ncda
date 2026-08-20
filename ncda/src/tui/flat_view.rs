@@ -6,12 +6,11 @@ use ratatui::Frame;
 
 use crate::model::{FileTree, NodeStats, SortBy};
 use crate::process::ProcessTable;
+use crate::rate::EventLog;
 use crate::tui::app::ViewState;
 use crate::tui::filter::{filtered_stats, join_path, FilterQuery};
-use crate::tui::footer::{format_bytes, format_count, format_latency};
-
-// Everything except the flexible name column: icon, graph, and metrics.
-const FIXED_COLUMNS_WIDTH: usize = 61;
+use crate::tui::footer::{format_bytes, format_bytes_raw, format_count, format_latency};
+use crate::tui::layout::{activity_cell, fit_display, TableColumns, WidthProfile};
 
 #[derive(Debug, Clone)]
 pub struct FlatRow {
@@ -37,7 +36,6 @@ pub fn visible_rows(
     } else {
         format!("/{}", cwd.join("/"))
     };
-
     let mut rows: Vec<FlatRow> = node
         .children
         .values()
@@ -67,14 +65,13 @@ pub fn visible_rows(
     rows
 }
 
-/// Render the flat (ncdu-style) view of a single directory's children.
 pub fn draw(
     f: &mut Frame,
     area: Rect,
     tree: &FileTree,
     processes: &ProcessTable,
+    event_log: &EventLog,
     view: &ViewState,
-    rate_fn: impl Fn(&str) -> f64,
 ) {
     let rows = visible_rows(
         tree,
@@ -90,20 +87,20 @@ pub fn draw(
         } else {
             "  (no activity matches the filter)"
         };
-        let empty =
-            List::new(vec![ListItem::new(message)]).block(Block::default().borders(Borders::NONE));
-        f.render_widget(empty, area);
+        f.render_widget(
+            List::new(vec![ListItem::new(message)]).block(Block::default().borders(Borders::NONE)),
+            area,
+        );
         return;
     }
 
-    let name_width = name_column_width(area.width);
+    let columns = TableColumns::for_width(area.width);
     let max_bytes = rows
         .iter()
         .map(|row| row.stats.total_bytes())
         .max()
         .unwrap_or(1)
         .max(1);
-
     let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
@@ -114,13 +111,9 @@ pub fn draw(
             } else {
                 row.name.clone()
             };
-            let bar_width = 10;
-            let fraction = row.stats.total_bytes() as f64 / max_bytes as f64;
-            let filled = (fraction * bar_width as f64) as usize;
-            let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
-            let rate = rate_fn(&row.path);
+            let rate = event_log.rate_for_prefix(&row.path);
             let rate_str = if rate > 0.0 {
-                format!("{}/s", crate::tui::footer::format_bytes_raw(rate as u64))
+                format!("{}/s", format_bytes_raw(rate as u64))
             } else {
                 "0B/s".to_string()
             };
@@ -131,114 +124,137 @@ pub fn draw(
             } else {
                 Style::default()
             };
-
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(prefix, style),
                 Span::styled(
-                    format!(
-                        "{:<width$}",
-                        truncate(&name, name_width),
-                        width = name_width
-                    ),
+                    fit_display(&name, columns.name),
                     style.fg(if row.is_dir {
                         Color::Blue
                     } else {
                         Color::White
                     }),
                 ),
-                Span::styled(bar, style.fg(Color::Cyan)),
-                Span::styled(
-                    format!("  R:{:>7}", format_bytes(row.stats.read_bytes)),
-                    style.fg(Color::Cyan),
-                ),
-                Span::styled(
-                    format!("  W:{:>7}", format_bytes(row.stats.write_bytes)),
-                    style.fg(Color::Red),
-                ),
-                Span::styled(
-                    format!("  {:>6}", format_count(row.stats.total_ops())),
+            ];
+            match columns.profile {
+                WidthProfile::Full => {
+                    let history = event_log.sparkline_for_prefix(&row.path, 8);
+                    spans.extend([
+                        Span::styled(
+                            activity_cell(
+                                row.stats.total_bytes(),
+                                max_bytes,
+                                &history,
+                                columns.graph,
+                            ),
+                            style.fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            format!("  R:{:>7}", format_bytes(row.stats.read_bytes)),
+                            style.fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            format!("  W:{:>7}", format_bytes(row.stats.write_bytes)),
+                            style.fg(Color::Red),
+                        ),
+                        Span::styled(
+                            format!("  {:>6}", format_count(row.stats.total_ops())),
+                            style.fg(Color::Yellow),
+                        ),
+                        Span::styled(format!("  {:>8}", rate_str), style.fg(Color::Green)),
+                        latency_span(&row.stats, style),
+                    ]);
+                }
+                WidthProfile::Compact => {
+                    let history = event_log.sparkline_for_prefix(&row.path, 8);
+                    spans.extend([
+                        Span::styled(
+                            activity_cell(
+                                row.stats.total_bytes(),
+                                max_bytes,
+                                &history,
+                                columns.graph,
+                            ),
+                            style.fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            format!("  {:>8}", format_bytes(row.stats.total_bytes())),
+                            style.fg(Color::Yellow),
+                        ),
+                        Span::styled(format!("  {:>8}", rate_str), style.fg(Color::Green)),
+                    ]);
+                }
+                WidthProfile::Minimal => spans.push(Span::styled(
+                    format!("  {:>8}", format_bytes(row.stats.total_bytes())),
                     style.fg(Color::Yellow),
-                ),
-                Span::styled(format!("  {:>8}", rate_str), style.fg(Color::Green)),
-                if row.stats.avg_latency_ns() > 0 {
-                    Span::styled(
-                        format!("  {:>7}", format_latency(row.stats.avg_latency_ns())),
-                        style.fg(if row.stats.avg_latency_ns() > 10_000_000 {
-                            Color::Red
-                        } else if row.stats.avg_latency_ns() > 1_000_000 {
-                            Color::Yellow
-                        } else {
-                            Color::White
-                        }),
-                    )
-                } else {
-                    Span::styled(" ".repeat(9), style)
-                },
-            ]);
-            ListItem::new(line)
+                )),
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
     let mut list_state = ListState::default();
     list_state.select(Some(view.cursor.min(rows.len().saturating_sub(1))));
-    let list = List::new(items).block(Block::default().borders(Borders::NONE));
-    f.render_stateful_widget(list, area, &mut list_state);
+    f.render_stateful_widget(
+        List::new(items).block(Block::default().borders(Borders::NONE)),
+        area,
+        &mut list_state,
+    );
+}
+
+fn latency_span(stats: &NodeStats, style: Style) -> Span<'static> {
+    if stats.avg_latency_ns() == 0 {
+        return Span::styled(" ".repeat(9), style);
+    }
+    Span::styled(
+        format!("  {:>7}", format_latency(stats.avg_latency_ns())),
+        style.fg(if stats.avg_latency_ns() > 10_000_000 {
+            Color::Red
+        } else if stats.avg_latency_ns() > 1_000_000 {
+            Color::Yellow
+        } else {
+            Color::White
+        }),
+    )
 }
 
 pub fn draw_columns(f: &mut Frame, area: Rect) {
-    let name_width = name_column_width(area.width);
-    let line = Line::from(vec![
-        Span::styled(
-            format!("  {:<width$}", "Name", width = name_width),
+    let columns = TableColumns::for_width(area.width);
+    let mut spans = vec![Span::styled(
+        format!("  {}", fit_display("Name", columns.name)),
+        Style::default().add_modifier(Modifier::DIM),
+    )];
+    match columns.profile {
+        WidthProfile::Full => spans.extend([
+            Span::styled(
+                fit_display("Activity", columns.graph),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled("    Read   ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("   Write   ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("     Ops", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("      Rate", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("  Latency", Style::default().add_modifier(Modifier::DIM)),
+        ]),
+        WidthProfile::Compact => spans.extend([
+            Span::styled(
+                fit_display("Activity", columns.graph),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled("     Total", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("      Rate", Style::default().add_modifier(Modifier::DIM)),
+        ]),
+        WidthProfile::Minimal => spans.push(Span::styled(
+            "     Total",
             Style::default().add_modifier(Modifier::DIM),
-        ),
-        Span::styled(
-            format!("{:<10}", "Graph"),
-            Style::default().add_modifier(Modifier::DIM),
-        ),
-        Span::styled("    Read   ", Style::default().add_modifier(Modifier::DIM)),
-        Span::styled("   Write   ", Style::default().add_modifier(Modifier::DIM)),
-        Span::styled("     Ops", Style::default().add_modifier(Modifier::DIM)),
-        Span::styled("      Rate", Style::default().add_modifier(Modifier::DIM)),
-        Span::styled("  Latency", Style::default().add_modifier(Modifier::DIM)),
-    ]);
-    f.render_widget(ratatui::widgets::Paragraph::new(line), area);
-}
-
-fn name_column_width(area_width: u16) -> usize {
-    usize::from(area_width)
-        .saturating_sub(FIXED_COLUMNS_WIDTH)
-        .max(1)
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max {
-        s.to_string()
-    } else if max > 1 {
-        let prefix: String = s.chars().take(max - 1).collect();
-        format!("{prefix}~")
-    } else {
-        "~".to_string()
+        )),
     }
+    f.render_widget(ratatui::widgets::Paragraph::new(Line::from(spans)), area);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::OpKind;
-
-    #[test]
-    fn flexible_name_column_fills_wide_areas() {
-        let width = 120;
-        let rendered_width = 2 + name_column_width(width) + 10 + 11 + 11 + 8 + 10 + 9;
-        assert_eq!(rendered_width, usize::from(width));
-    }
-
-    #[test]
-    fn truncation_is_unicode_safe() {
-        assert_eq!(truncate("données", 5), "donn~");
-    }
 
     #[test]
     fn visible_rows_use_the_same_filter_and_sort_projection() {

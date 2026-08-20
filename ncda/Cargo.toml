@@ -25,6 +25,7 @@ tokio = { workspace = true, features = [
 ] }
 ratatui = "0.29"
 crossterm = "0.28"
+unicode-width = "0.2"
 
 [build-dependencies]
 anyhow = { workspace = true }

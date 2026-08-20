@@ -59,9 +59,9 @@ impl AppState {
                     // so they appear grouped in the tree.
                     if let Some(name) = self.containers.resolve(pid) {
                         if resolved.starts_with('/') {
-                            resolved = format!("[{name}]{resolved}");
+                            resolved = format!("/[{name}]{resolved}");
                         } else {
-                            resolved = format!("[{name}]/{resolved}");
+                            resolved = format!("/[{name}]/{resolved}");
                         }
                     }
 
@@ -90,7 +90,7 @@ impl AppState {
                             .record(&path, pid, OpKind::Read, bytes, latency_ns);
                         self.record_process(pid, OpKind::Read, bytes, latency_ns);
                         self.global_rate.record(bytes);
-                        self.event_log.record(path, bytes);
+                        self.event_log.record(path, pid, bytes);
                     }
                 }
                 BpfEvent::Write {
@@ -109,7 +109,7 @@ impl AppState {
                             .record(&path, pid, OpKind::Write, bytes, latency_ns);
                         self.record_process(pid, OpKind::Write, bytes, latency_ns);
                         self.global_rate.record(bytes);
-                        self.event_log.record(path, bytes);
+                        self.event_log.record(path, pid, bytes);
                     }
                 }
                 BpfEvent::Close {
@@ -156,9 +156,9 @@ impl AppState {
         let mut resolved = self.fd_cache.resolve_existing(pid, fd)?;
         if let Some(name) = self.containers.resolve(pid) {
             if resolved.starts_with('/') {
-                resolved = format!("[{name}]{resolved}");
+                resolved = format!("/[{name}]{resolved}");
             } else {
-                resolved = format!("[{name}]/{resolved}");
+                resolved = format!("/[{name}]/{resolved}");
             }
         }
         self.fd_cache.store(pid, fd, resolved.clone());

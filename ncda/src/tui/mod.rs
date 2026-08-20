@@ -4,6 +4,7 @@ pub mod flat_view;
 pub mod footer;
 pub mod header;
 pub mod input;
+pub mod layout;
 pub mod tree_view;
 
 use std::io;
@@ -138,29 +139,18 @@ fn draw(f: &mut ratatui::Frame, state: &AppState, view: &ViewState) {
 
     header::draw(f, chunks[0], view);
 
-    let (columns_area, main_area) = if view.show_processes {
-        // Split the complete table body so its header stays aligned with the
-        // main rows and the process panel can use the full body height.
-        let body_area = Rect::new(
-            chunks[1].x,
-            chunks[1].y,
-            chunks[1].width,
-            chunks[1].height.saturating_add(chunks[2].height),
-        );
-        let body_columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-            .split(body_area);
-        let main_rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
-            .split(body_columns[0]);
-
-        draw_process_panel(f, body_columns[1], state, view);
-        (main_rows[0], main_rows[1])
-    } else {
-        (chunks[1], chunks[2])
-    };
+    let body_area = Rect::new(
+        chunks[1].x,
+        chunks[1].y,
+        chunks[1].width,
+        chunks[1].height.saturating_add(chunks[2].height),
+    );
+    let body = compute_body_areas(body_area, view.show_processes);
+    if let Some(process_area) = body.processes {
+        draw_process_panel(f, process_area, state, view, body.process_borders);
+    }
+    let columns_area = body.columns;
+    let main_area = body.main;
 
     match view.mode {
         ViewMode::Flat => {
@@ -170,8 +160,8 @@ fn draw(f: &mut ratatui::Frame, state: &AppState, view: &ViewState) {
                 main_area,
                 &state.tree,
                 &state.process_table,
+                &state.event_log,
                 view,
-                |prefix| state.event_log.rate_for_prefix(prefix),
             );
         }
         ViewMode::Tree => {
@@ -184,11 +174,11 @@ fn draw(f: &mut ratatui::Frame, state: &AppState, view: &ViewState) {
                 &view.filter,
                 &state.process_table,
             );
-            tree_view::draw(f, main_area, &lines, view.cursor);
+            tree_view::draw(f, main_area, &lines, view.cursor, &state.event_log);
         }
     }
 
-    let rate = state.global_rate.clone_rate();
+    let rate = state.global_rate.rate_bps();
     footer::draw(
         f,
         chunks[3],
@@ -204,8 +194,69 @@ fn draw(f: &mut ratatui::Frame, state: &AppState, view: &ViewState) {
     }
 }
 
-fn draw_process_panel(f: &mut ratatui::Frame, area: Rect, state: &AppState, view: &ViewState) {
-    let block = Block::default().title(" Processes ").borders(Borders::LEFT);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BodyAreas {
+    columns: Rect,
+    main: Rect,
+    processes: Option<Rect>,
+    process_borders: Borders,
+}
+
+fn compute_body_areas(area: Rect, show_processes: bool) -> BodyAreas {
+    if !show_processes {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
+        return BodyAreas {
+            columns: rows[0],
+            main: rows[1],
+            processes: None,
+            process_borders: Borders::NONE,
+        };
+    }
+
+    if area.width >= 110 {
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(area);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(panes[0]);
+        BodyAreas {
+            columns: rows[0],
+            main: rows[1],
+            processes: Some(panes[1]),
+            process_borders: Borders::LEFT,
+        }
+    } else {
+        let panes = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(area);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(panes[0]);
+        BodyAreas {
+            columns: rows[0],
+            main: rows[1],
+            processes: Some(panes[1]),
+            process_borders: Borders::TOP,
+        }
+    }
+}
+
+fn draw_process_panel(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    state: &AppState,
+    view: &ViewState,
+    borders: Borders,
+) {
+    let block = Block::default().title(" Processes ").borders(borders);
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -220,11 +271,7 @@ fn draw_process_panel(f: &mut ratatui::Frame, area: Rect, state: &AppState, view
             Line::from(vec![
                 Span::styled(format!("{:>6} ", p.pid), Style::default().fg(Color::Yellow)),
                 Span::styled(
-                    format!(
-                        "{:<width$} ",
-                        truncate_str(&p.comm, comm_width),
-                        width = comm_width
-                    ),
+                    format!("{} ", layout::fit_display(&p.comm, comm_width)),
                     Style::default().fg(Color::White),
                 ),
                 Span::styled(
@@ -298,18 +345,6 @@ fn process_name_width(area_width: u16) -> usize {
     usize::from(area_width).saturating_sub(25).max(1)
 }
 
-fn truncate_str(s: &str, max: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max {
-        s.to_string()
-    } else if max > 1 {
-        let prefix: String = s.chars().take(max - 1).collect();
-        format!("{prefix}~")
-    } else {
-        "~".to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,7 +356,13 @@ mod tests {
     }
 
     #[test]
-    fn process_name_truncation_is_unicode_safe() {
-        assert_eq!(truncate_str("téléchargement", 6), "téléc~");
+    fn process_panel_moves_below_narrow_tables() {
+        let narrow = compute_body_areas(Rect::new(0, 0, 80, 20), true);
+        assert_eq!(narrow.process_borders, Borders::TOP);
+        assert!(narrow.processes.unwrap().y > narrow.main.y);
+
+        let wide = compute_body_areas(Rect::new(0, 0, 140, 20), true);
+        assert_eq!(wide.process_borders, Borders::LEFT);
+        assert!(wide.processes.unwrap().x > wide.main.x);
     }
 }

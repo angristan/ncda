@@ -8,14 +8,15 @@ use ratatui::Frame;
 
 use crate::model::{FileTree, NodeStats, SortBy, TreeNode};
 use crate::process::ProcessTable;
+use crate::rate::EventLog;
 use crate::tui::filter::{filtered_stats, join_path, FilterQuery};
-use crate::tui::footer::{format_bytes, format_count, format_latency};
-
-const FIXED_COLUMNS_WIDTH: usize = 44;
+use crate::tui::footer::{format_bytes, format_bytes_raw, format_count, format_latency};
+use crate::tui::layout::{activity_cell, fit_display, TableColumns, WidthProfile};
 
 pub struct TreeLine {
     pub depth: usize,
     pub path: Vec<String>,
+    pub display_path: String,
     pub name: String,
     pub is_dir: bool,
     pub is_expanded: bool,
@@ -83,6 +84,7 @@ fn flatten_recurse(
         lines.push(TreeLine {
             depth,
             path: path.clone(),
+            display_path: child_display_path.clone(),
             name: child.name.clone(),
             is_dir: child.is_dir,
             is_expanded,
@@ -92,7 +94,6 @@ fn flatten_recurse(
             avg_latency_ns: stats.avg_latency_ns(),
             total_bytes: stats.total_bytes(),
         });
-
         if child.is_dir && is_expanded {
             flatten_recurse(
                 child,
@@ -111,15 +112,18 @@ fn flatten_recurse(
     }
 }
 
-pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize) {
+pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize, event_log: &EventLog) {
     if lines.is_empty() {
-        let empty = List::new(vec![ListItem::new("  (no activity matches)")])
-            .block(Block::default().borders(Borders::NONE));
-        f.render_widget(empty, area);
+        f.render_widget(
+            List::new(vec![ListItem::new("  (no activity matches)")])
+                .block(Block::default().borders(Borders::NONE)),
+            area,
+        );
         return;
     }
 
-    let name_column_width = name_column_width(area.width);
+    let columns = TableColumns::for_width(area.width);
+    let tree_name_width = columns.name + 2;
     let max_bytes = lines
         .iter()
         .map(|line| line.total_bytes)
@@ -130,8 +134,7 @@ pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize) {
         .iter()
         .enumerate()
         .map(|(index, line)| {
-            let indent_width = (line.depth * 2).min(name_column_width.saturating_sub(3));
-            let indent = " ".repeat(indent_width);
+            let indent_width = (line.depth * 2).min(tree_name_width.saturating_sub(3));
             let icon = if line.is_dir {
                 if line.is_expanded {
                     "▾ "
@@ -146,10 +149,7 @@ pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize) {
             } else {
                 line.name.clone()
             };
-            let bar_width = 8;
-            let fraction = line.total_bytes as f64 / max_bytes as f64;
-            let filled = (fraction * bar_width as f64) as usize;
-            let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+            let name_width = tree_name_width.saturating_sub(indent_width + 2).max(1);
             let style = if index == cursor {
                 Style::default()
                     .bg(Color::DarkGray)
@@ -157,110 +157,129 @@ pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize) {
             } else {
                 Style::default()
             };
-            let max_name_width = name_column_width.saturating_sub(indent_width + 2).max(1);
-
-            ListItem::new(Line::from(vec![
-                Span::styled(indent, style),
+            let rate = event_log.rate_for_prefix(&line.display_path);
+            let rate_str = if rate > 0.0 {
+                format!("{}/s", format_bytes_raw(rate as u64))
+            } else {
+                "0B/s".to_string()
+            };
+            let mut spans = vec![
+                Span::styled(" ".repeat(indent_width), style),
                 Span::styled(icon, style),
                 Span::styled(
-                    format!(
-                        "{:<width$}",
-                        truncate(&name, max_name_width),
-                        width = max_name_width
-                    ),
+                    fit_display(&name, name_width),
                     style.fg(if line.is_dir {
                         Color::Blue
                     } else {
                         Color::White
                     }),
                 ),
-                Span::styled(" ", style),
-                Span::styled(bar, style.fg(Color::Cyan)),
-                Span::styled(
-                    format!(" R:{:>7}", format_bytes(line.read_bytes)),
-                    style.fg(Color::Cyan),
-                ),
-                Span::styled(
-                    format!(" W:{:>7}", format_bytes(line.write_bytes)),
-                    style.fg(Color::Red),
-                ),
-                Span::styled(
-                    format!(" {:>6}", format_count(line.total_ops)),
+            ];
+            match columns.profile {
+                WidthProfile::Full => {
+                    let history = event_log.sparkline_for_prefix(&line.display_path, 8);
+                    spans.extend([
+                        Span::styled(
+                            activity_cell(line.total_bytes, max_bytes, &history, columns.graph),
+                            style.fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            format!("  R:{:>7}", format_bytes(line.read_bytes)),
+                            style.fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            format!("  W:{:>7}", format_bytes(line.write_bytes)),
+                            style.fg(Color::Red),
+                        ),
+                        Span::styled(
+                            format!("  {:>6}", format_count(line.total_ops)),
+                            style.fg(Color::Yellow),
+                        ),
+                        Span::styled(format!("  {:>8}", rate_str), style.fg(Color::Green)),
+                        latency_span(line.avg_latency_ns, style),
+                    ]);
+                }
+                WidthProfile::Compact => {
+                    let history = event_log.sparkline_for_prefix(&line.display_path, 8);
+                    spans.extend([
+                        Span::styled(
+                            activity_cell(line.total_bytes, max_bytes, &history, columns.graph),
+                            style.fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            format!("  {:>8}", format_bytes(line.total_bytes)),
+                            style.fg(Color::Yellow),
+                        ),
+                        Span::styled(format!("  {:>8}", rate_str), style.fg(Color::Green)),
+                    ]);
+                }
+                WidthProfile::Minimal => spans.push(Span::styled(
+                    format!("  {:>8}", format_bytes(line.total_bytes)),
                     style.fg(Color::Yellow),
-                ),
-                if line.avg_latency_ns > 0 {
-                    Span::styled(
-                        format!(" {:>7}", format_latency(line.avg_latency_ns)),
-                        style.fg(Color::White),
-                    )
-                } else {
-                    Span::styled(" ".repeat(8), style)
-                },
-            ]))
+                )),
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
     let mut state = ListState::default();
     state.select(Some(cursor.min(lines.len().saturating_sub(1))));
-    let list = List::new(items).block(Block::default().borders(Borders::NONE));
-    f.render_stateful_widget(list, area, &mut state);
+    f.render_stateful_widget(
+        List::new(items).block(Block::default().borders(Borders::NONE)),
+        area,
+        &mut state,
+    );
+}
+
+fn latency_span(latency_ns: u64, style: Style) -> Span<'static> {
+    if latency_ns == 0 {
+        Span::styled(" ".repeat(9), style)
+    } else {
+        Span::styled(
+            format!("  {:>7}", format_latency(latency_ns)),
+            style.fg(Color::White),
+        )
+    }
 }
 
 pub fn draw_columns(f: &mut Frame, area: Rect) {
-    let name_column_width = name_column_width(area.width);
-    let line = Line::from(vec![
-        Span::styled(
-            format!("{:<width$}", "  Name", width = name_column_width),
+    let columns = TableColumns::for_width(area.width);
+    let mut spans = vec![Span::styled(
+        fit_display("  Name", columns.name + 2),
+        Style::default().add_modifier(Modifier::DIM),
+    )];
+    match columns.profile {
+        WidthProfile::Full => spans.extend([
+            Span::styled(
+                fit_display("Activity", columns.graph),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled("    Read   ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("   Write   ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("     Ops", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("      Rate", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("  Latency", Style::default().add_modifier(Modifier::DIM)),
+        ]),
+        WidthProfile::Compact => spans.extend([
+            Span::styled(
+                fit_display("Activity", columns.graph),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled("     Total", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("      Rate", Style::default().add_modifier(Modifier::DIM)),
+        ]),
+        WidthProfile::Minimal => spans.push(Span::styled(
+            "     Total",
             Style::default().add_modifier(Modifier::DIM),
-        ),
-        Span::styled(
-            format!(" {:<8}", "Graph"),
-            Style::default().add_modifier(Modifier::DIM),
-        ),
-        Span::styled("     Read ", Style::default().add_modifier(Modifier::DIM)),
-        Span::styled("    Write ", Style::default().add_modifier(Modifier::DIM)),
-        Span::styled("    Ops", Style::default().add_modifier(Modifier::DIM)),
-        Span::styled(" Latency", Style::default().add_modifier(Modifier::DIM)),
-    ]);
-    f.render_widget(ratatui::widgets::Paragraph::new(line), area);
-}
-
-fn name_column_width(area_width: u16) -> usize {
-    usize::from(area_width)
-        .saturating_sub(FIXED_COLUMNS_WIDTH)
-        .max(3)
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max {
-        s.to_string()
-    } else if max > 1 {
-        let prefix: String = s.chars().take(max - 1).collect();
-        format!("{prefix}~")
-    } else {
-        "~".to_string()
+        )),
     }
+    f.render_widget(ratatui::widgets::Paragraph::new(Line::from(spans)), area);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::OpKind;
-
-    #[test]
-    fn flexible_name_column_fills_wide_areas() {
-        let width = 120;
-        let rendered_width = name_column_width(width) + 9 + 10 + 10 + 7 + 8;
-        assert_eq!(rendered_width, usize::from(width));
-    }
-
-    #[test]
-    fn deep_indentation_keeps_room_for_a_name() {
-        let column_width = name_column_width(80);
-        let indent_width = (100 * 2).min(column_width.saturating_sub(3));
-        assert!(column_width.saturating_sub(indent_width + 2) >= 1);
-    }
 
     #[test]
     fn filtered_flatten_keeps_matching_ancestors() {
