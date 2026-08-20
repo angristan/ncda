@@ -21,6 +21,7 @@ pub enum BpfEvent {
         pid: u32,
         tid: u32,
         fd: u32,
+        dirfd: i32,
         path: String,
     },
     Read {
@@ -41,6 +42,12 @@ pub enum BpfEvent {
         pid: u32,
         tid: u32,
         fd: u32,
+    },
+    Dup {
+        pid: u32,
+        tid: u32,
+        old_fd: u32,
+        new_fd: u32,
     },
 }
 
@@ -93,17 +100,34 @@ pub fn load_and_attach(ebpf: &mut Ebpf) -> Result<()> {
     let tracepoints = [
         ("sys_enter_openat", "syscalls", "sys_enter_openat"),
         ("sys_exit_openat", "syscalls", "sys_exit_openat"),
+        ("sys_enter_openat2", "syscalls", "sys_enter_openat2"),
+        ("sys_exit_openat2", "syscalls", "sys_exit_openat2"),
         ("sys_enter_read", "syscalls", "sys_enter_read"),
         ("sys_exit_read", "syscalls", "sys_exit_read"),
         ("sys_enter_write", "syscalls", "sys_enter_write"),
         ("sys_exit_write", "syscalls", "sys_exit_write"),
+        ("sys_enter_pread64", "syscalls", "sys_enter_pread64"),
+        ("sys_exit_pread64", "syscalls", "sys_exit_pread64"),
+        ("sys_enter_pwrite64", "syscalls", "sys_enter_pwrite64"),
+        ("sys_exit_pwrite64", "syscalls", "sys_exit_pwrite64"),
+        ("sys_enter_readv", "syscalls", "sys_enter_readv"),
+        ("sys_exit_readv", "syscalls", "sys_exit_readv"),
+        ("sys_enter_writev", "syscalls", "sys_enter_writev"),
+        ("sys_exit_writev", "syscalls", "sys_exit_writev"),
         ("sys_enter_close", "syscalls", "sys_enter_close"),
+        ("sys_exit_close", "syscalls", "sys_exit_close"),
+        ("sys_enter_dup", "syscalls", "sys_enter_dup"),
+        ("sys_exit_dup", "syscalls", "sys_exit_dup"),
+        ("sys_enter_dup2", "syscalls", "sys_enter_dup2"),
+        ("sys_exit_dup2", "syscalls", "sys_exit_dup2"),
+        ("sys_enter_dup3", "syscalls", "sys_enter_dup3"),
+        ("sys_exit_dup3", "syscalls", "sys_exit_dup3"),
     ];
 
     for (prog_name, category, tp_name) in &tracepoints {
         let program: &mut TracePoint = ebpf
             .program_mut(prog_name)
-            .unwrap()
+            .with_context(|| format!("program {prog_name} not found"))?
             .try_into()
             .with_context(|| format!("failed to get program {prog_name}"))?;
         program.load()?;
@@ -209,6 +233,7 @@ fn parse_event(data: &[u8]) -> Option<BpfEvent> {
         EVENT_READ => parse_io_event(data, EVENT_READ),
         EVENT_WRITE => parse_io_event(data, EVENT_WRITE),
         EVENT_CLOSE => parse_io_event(data, EVENT_CLOSE),
+        EVENT_DUP => parse_fd_event(data),
         _ => {
             debug!("unknown event kind: {kind}");
             None
@@ -226,8 +251,9 @@ fn parse_open_event(data: &[u8]) -> Option<BpfEvent> {
     let tid = u32::from_ne_bytes(data[8..12].try_into().ok()?);
     let fd = u32::from_ne_bytes(data[12..16].try_into().ok()?);
     let fname_len = u32::from_ne_bytes(data[16..20].try_into().ok()?);
+    let dirfd = i32::from_ne_bytes(data[20..24].try_into().ok()?);
 
-    let fname_start = 24; // after kind, pid, tid, fd, fname_len, _pad
+    let fname_start = 24; // after kind, pid, tid, fd, fname_len, dirfd
     let fname_end = fname_start + (fname_len as usize).min(MAX_FNAME_LEN);
     let fname_bytes = &data[fname_start..fname_end.min(data.len())];
 
@@ -237,7 +263,13 @@ fn parse_open_event(data: &[u8]) -> Option<BpfEvent> {
         .trim_end_matches('\0')
         .to_string();
 
-    Some(BpfEvent::Open { pid, tid, fd, path })
+    Some(BpfEvent::Open {
+        pid,
+        tid,
+        fd,
+        dirfd,
+        path,
+    })
 }
 
 fn parse_io_event(data: &[u8], kind: u32) -> Option<BpfEvent> {
@@ -271,6 +303,19 @@ fn parse_io_event(data: &[u8], kind: u32) -> Option<BpfEvent> {
     }
 }
 
+fn parse_fd_event(data: &[u8]) -> Option<BpfEvent> {
+    if data.len() < core::mem::size_of::<FdEvent>() {
+        return None;
+    }
+
+    Some(BpfEvent::Dup {
+        pid: u32::from_ne_bytes(data[4..8].try_into().ok()?),
+        tid: u32::from_ne_bytes(data[8..12].try_into().ok()?),
+        old_fd: u32::from_ne_bytes(data[12..16].try_into().ok()?),
+        new_fd: u32::from_ne_bytes(data[16..20].try_into().ok()?),
+    })
+}
+
 /// Fd-to-path cache maintained in userspace.
 /// Maps (pid, fd) → path string.
 ///
@@ -296,8 +341,14 @@ impl FdPathCache {
 
     /// Resolve the raw eBPF-captured path via procfs and return it.
     /// Does **not** store the result — call [`store`] afterwards.
-    pub fn resolve(&mut self, pid: u32, fd: u32, raw_path: &str) -> String {
-        self.resolve_fd_path(pid, fd, raw_path)
+    pub fn resolve(&mut self, pid: u32, fd: u32, dirfd: i32, raw_path: &str) -> String {
+        self.resolve_fd_path(pid, fd, dirfd, raw_path)
+    }
+
+    /// Resolve an inherited or pre-existing descriptor on a cache miss.
+    pub fn resolve_existing(&mut self, pid: u32, fd: u32) -> Option<String> {
+        let path = self.resolve_fd_path(pid, fd, libc::AT_FDCWD, "");
+        (!path.is_empty()).then_some(path)
     }
 
     /// Store the final (possibly container-prefixed) path for a pid/fd.
@@ -319,7 +370,7 @@ impl FdPathCache {
 
     /// Resolve the true file path for a given pid/fd via procfs.
     /// Falls back to the raw eBPF-captured path if resolution fails.
-    fn resolve_fd_path(&mut self, pid: u32, fd: u32, raw_path: &str) -> String {
+    fn resolve_fd_path(&mut self, pid: u32, fd: u32, dirfd: i32, raw_path: &str) -> String {
         // Try readlink on /proc/pid/fd/fd to get the kernel-resolved path.
         // This works even for relative openat(dirfd, name, ...) calls
         // because the kernel has already resolved the path.
@@ -340,15 +391,20 @@ impl FdPathCache {
         }
 
         // For relative paths where /proc/pid/fd failed (fd already closed),
-        // try to prepend the process working directory
-        if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
-            if let Some(cwd_str) = cwd.to_str() {
-                let full_path = format!("{cwd_str}/{raw_path}");
+        // resolve from cwd for AT_FDCWD or from the actual directory FD.
+        let base = if dirfd == libc::AT_FDCWD {
+            std::fs::read_link(format!("/proc/{pid}/cwd"))
+        } else {
+            std::fs::read_link(format!("/proc/{pid}/fd/{dirfd}"))
+        };
+        if let Ok(base) = base {
+            if let Some(base) = base.to_str() {
+                let full_path = format!("{base}/{raw_path}");
                 return self.strip_container_root(pid, &full_path);
             }
         }
 
-        // Last resort: return the raw path as captured by eBPF
+        // Last resort: return the raw path as captured by eBPF.
         raw_path.to_string()
     }
 
@@ -388,6 +444,7 @@ mod tests {
     fn shared_event_abi_has_expected_sizes() {
         assert_eq!(core::mem::size_of::<OpenEvent>(), 280);
         assert_eq!(core::mem::size_of::<IoEvent>(), 32);
+        assert_eq!(core::mem::size_of::<FdEvent>(), 24);
         assert_eq!(core::mem::size_of::<CaptureStats>(), 24);
     }
 
@@ -413,5 +470,67 @@ mod tests {
         let mut unknown = [0_u8; 32];
         unknown[0..4].copy_from_slice(&99_u32.to_ne_bytes());
         assert!(parse_event(&unknown).is_none());
+    }
+
+    #[test]
+    fn parser_preserves_open_dirfd_and_dup_fds() {
+        let mut open = [0_u8; 280];
+        open[0..4].copy_from_slice(&EVENT_OPEN.to_ne_bytes());
+        open[4..8].copy_from_slice(&7_u32.to_ne_bytes());
+        open[8..12].copy_from_slice(&8_u32.to_ne_bytes());
+        open[12..16].copy_from_slice(&9_u32.to_ne_bytes());
+        open[16..20].copy_from_slice(&4_u32.to_ne_bytes());
+        open[20..24].copy_from_slice(&(-100_i32).to_ne_bytes());
+        open[24..28].copy_from_slice(b"file");
+        assert!(matches!(
+            parse_event(&open),
+            Some(BpfEvent::Open {
+                pid: 7,
+                tid: 8,
+                fd: 9,
+                dirfd: -100,
+                ref path,
+            }) if path == "file"
+        ));
+
+        let mut dup = [0_u8; 24];
+        dup[0..4].copy_from_slice(&EVENT_DUP.to_ne_bytes());
+        dup[4..8].copy_from_slice(&7_u32.to_ne_bytes());
+        dup[8..12].copy_from_slice(&8_u32.to_ne_bytes());
+        dup[12..16].copy_from_slice(&9_u32.to_ne_bytes());
+        dup[16..20].copy_from_slice(&10_u32.to_ne_bytes());
+        assert!(matches!(
+            parse_event(&dup),
+            Some(BpfEvent::Dup {
+                pid: 7,
+                tid: 8,
+                old_fd: 9,
+                new_fd: 10,
+            })
+        ));
+    }
+
+    #[test]
+    fn relative_fallback_uses_directory_fd() {
+        use std::os::fd::AsRawFd;
+
+        let directory = std::fs::File::open("/tmp").unwrap();
+        let mut cache = FdPathCache::new();
+        let resolved = cache.resolve(std::process::id(), u32::MAX, directory.as_raw_fd(), "child");
+
+        assert_eq!(resolved, "/tmp/child");
+    }
+
+    #[test]
+    fn preexisting_descriptor_resolves_on_cache_miss() {
+        use std::os::fd::AsRawFd;
+
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let mut cache = FdPathCache::new();
+        let resolved = cache
+            .resolve_existing(std::process::id(), file.as_raw_fd() as u32)
+            .unwrap();
+
+        assert_eq!(resolved, "/dev/null");
     }
 }

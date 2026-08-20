@@ -8,6 +8,7 @@ pub const EVENT_OPEN: u32 = 1;
 pub const EVENT_READ: u32 = 2;
 pub const EVENT_WRITE: u32 = 3;
 pub const EVENT_CLOSE: u32 = 4;
+pub const EVENT_DUP: u32 = 5;
 
 /// Open event — includes the filename captured at openat() time.
 /// Sent from eBPF to userspace via RingBuf.
@@ -20,7 +21,7 @@ pub struct OpenEvent {
     pub tid: u32,
     pub fd: u32,
     pub fname_len: u32,
-    pub _pad: u32,
+    pub dirfd: i32,
     pub fname: [u8; MAX_FNAME_LEN],
 }
 
@@ -44,14 +45,29 @@ pub struct IoEvent {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for IoEvent {}
 
-/// Stash for openat entry → exit correlation.
+/// File-descriptor lifecycle event used for successful dup operations.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FdEvent {
+    pub kind: u32,
+    pub pid: u32,
+    pub tid: u32,
+    pub old_fd: u32,
+    pub new_fd: u32,
+    pub _pad: u32,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for FdEvent {}
+
+/// Stash for openat/openat2 entry → exit correlation.
 /// Stored in a HashMap keyed by pid_tgid.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct OpenArgs {
     pub fname: [u8; MAX_FNAME_LEN],
     pub fname_len: u32,
-    pub flags: u32,
+    pub dirfd: i32,
 }
 
 /// Stash for read/write entry → exit correlation.
@@ -60,6 +76,14 @@ pub struct OpenArgs {
 #[derive(Clone, Copy)]
 pub struct RwArgs {
     pub ts: u64,
+    pub fd: u32,
+    pub _pad: u32,
+}
+
+/// Stash for close and dup entry → exit correlation.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FdArgs {
     pub fd: u32,
     pub _pad: u32,
 }

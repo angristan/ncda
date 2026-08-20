@@ -9,30 +9,23 @@ use aya_ebpf::{
 };
 use ncda_common::*;
 
-// ---------------------------------------------------------------------------
-// Maps
-// ---------------------------------------------------------------------------
-
 /// Ring buffer for sending events to userspace (16 MiB).
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0);
 
-/// Stash for correlating sys_enter_openat → sys_exit_openat.
-/// Key: pid_tgid (u64).  Value: OpenArgs (filename + flags).
+/// Entry/exit correlation maps keyed by pid_tgid.
 #[map]
 static OPEN_STASH: HashMap<u64, OpenArgs> = HashMap::with_max_entries(8192, 0);
-
-/// Stash for correlating sys_enter_{read,write} → sys_exit_{read,write}.
-/// Key: pid_tgid (u64).  Value: RwArgs (timestamp + fd).
 #[map]
 static RW_STASH: HashMap<u64, RwArgs> = HashMap::with_max_entries(8192, 0);
+#[map]
+static CLOSE_STASH: HashMap<u64, FdArgs> = HashMap::with_max_entries(8192, 0);
+#[map]
+static DUP_STASH: HashMap<u64, FdArgs> = HashMap::with_max_entries(8192, 0);
 
-/// Per-CPU scratch buffer for constructing OpenArgs values.
-/// Avoids putting 264-byte OpenArgs on the 512-byte eBPF stack.
+/// Per-CPU scratch buffers avoid the eBPF 512-byte stack limit.
 #[map]
 static SCRATCH: PerCpuArray<OpenArgs> = PerCpuArray::with_max_entries(1, 0);
-
-/// Per-CPU scratch buffer for constructing OpenEvent values before output.
 #[map]
 static EVENT_BUF: PerCpuArray<OpenEvent> = PerCpuArray::with_max_entries(1, 0);
 
@@ -61,31 +54,25 @@ fn record_scratch_failure() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// sys_enter_openat — capture filename and stash for exit handler
-// ---------------------------------------------------------------------------
-//
-// Tracepoint format (x86_64):
-//   offset 8:  __syscall_nr (i32)
-//   offset 16: dfd          (u64)
-//   offset 24: filename     (u64, user pointer)
-//   offset 32: flags        (u64)
-//   offset 40: mode         (u64)
+// Named syscall tracepoints expose each argument as an eight-byte field after
+// the common 16-byte prefix on supported 64-bit kernels. Userspace validates
+// these layouts before attachment.
 
 #[tracepoint]
 pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_openat(&ctx) {
-        Ok(ret) => ret,
-        Err(_) => 0,
-    }
+    try_sys_enter_open(&ctx).unwrap_or(0)
 }
 
-fn try_sys_enter_openat(ctx: &TracePointContext) -> Result<u32, i64> {
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let filename_ptr: u64 = unsafe { ctx.read_at(24)? };
-    let flags: u64 = unsafe { ctx.read_at(32)? };
+#[tracepoint]
+pub fn sys_enter_openat2(ctx: TracePointContext) -> u32 {
+    try_sys_enter_open(&ctx).unwrap_or(0)
+}
 
-    // Get scratch buffer (per-CPU, avoids stack overflow).
+fn try_sys_enter_open(ctx: &TracePointContext) -> Result<u32, i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let dirfd: i64 = unsafe { ctx.read_at(16)? };
+    let filename_ptr: u64 = unsafe { ctx.read_at(24)? };
+
     let scratch = match SCRATCH.get_ptr_mut(0) {
         Some(scratch) => scratch,
         None => {
@@ -94,61 +81,45 @@ fn try_sys_enter_openat(ctx: &TracePointContext) -> Result<u32, i64> {
         }
     };
     let args = unsafe { &mut *scratch };
-    args.flags = flags as u32;
+    args.dirfd = dirfd as i32;
     args.fname_len = 0;
 
-    // Read filename from user-space pointer into scratch buffer
-    match unsafe { bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut args.fname) } {
-        Ok(s) => args.fname_len = s.len() as u32,
-        Err(_) => args.fname_len = 0,
+    if let Ok(filename) =
+        unsafe { bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut args.fname) }
+    {
+        args.fname_len = filename.len() as u32;
     }
 
-    // Stash for sys_exit_openat to pick up.
     if OPEN_STASH.insert(&pid_tgid, args, 0).is_err() {
         record_stash_failure();
         return Err(1);
     }
-
     Ok(0)
 }
 
-// ---------------------------------------------------------------------------
-// sys_exit_openat — emit OpenEvent with fd + path
-// ---------------------------------------------------------------------------
-//
-// Tracepoint format:
-//   offset 8:  __syscall_nr (i32)
-//   offset 16: ret          (i64) — fd on success, negative errno on failure
-
 #[tracepoint]
 pub fn sys_exit_openat(ctx: TracePointContext) -> u32 {
-    match try_sys_exit_openat(&ctx) {
-        Ok(ret) => ret,
-        Err(_) => 0,
-    }
+    try_sys_exit_open(&ctx).unwrap_or(0)
 }
 
-fn try_sys_exit_openat(ctx: &TracePointContext) -> Result<u32, i64> {
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let ret: i64 = unsafe { ctx.read_at(16)? };
+#[tracepoint]
+pub fn sys_exit_openat2(ctx: TracePointContext) -> u32 {
+    try_sys_exit_open(&ctx).unwrap_or(0)
+}
 
-    // Look up stashed args from entry
+fn try_sys_exit_open(ctx: &TracePointContext) -> Result<u32, i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let result: i64 = unsafe { ctx.read_at(16)? };
     let stash = match unsafe { OPEN_STASH.get(&pid_tgid) } {
         Some(args) => args,
         None => return Ok(0),
     };
 
-    if ret < 0 {
-        // Open failed — clean up stash
+    if result < 0 {
         let _ = OPEN_STASH.remove(&pid_tgid);
         return Ok(0);
     }
 
-    let fd = ret as u32;
-    let tgid = (pid_tgid >> 32) as u32;
-    let tid = pid_tgid as u32;
-
-    // Construct OpenEvent in per-CPU buffer.
     let buf = match EVENT_BUF.get_ptr_mut(0) {
         Some(buf) => buf,
         None => {
@@ -159,67 +130,51 @@ fn try_sys_exit_openat(ctx: &TracePointContext) -> Result<u32, i64> {
     };
     let event = unsafe { &mut *buf };
     event.kind = EVENT_OPEN;
-    event.pid = tgid;
-    event.tid = tid;
-    event.fd = fd;
+    event.pid = (pid_tgid >> 32) as u32;
+    event.tid = pid_tgid as u32;
+    event.fd = result as u32;
     event.fname_len = stash.fname_len;
-    event._pad = 0;
+    event.dirfd = stash.dirfd;
 
-    // Copy filename from stash into event buffer.
-    // Both pointers are to BPF map memory with known bounds.
-    // Use a bounded loop that the verifier can track.
-    let src = &stash.fname;
-    let dst = &mut event.fname;
-    let mut i = 0usize;
-    while i < MAX_FNAME_LEN {
-        dst[i] = src[i];
-        i += 1;
+    let mut index = 0usize;
+    while index < MAX_FNAME_LEN {
+        event.fname[index] = stash.fname[index];
+        index += 1;
     }
 
-    // Output event to ring buffer.
     if EVENTS.output::<OpenEvent>(unsafe { &*buf }, 0).is_err() {
         record_ring_drop();
     }
-
-    // Clean up stash
     let _ = OPEN_STASH.remove(&pid_tgid);
-
     Ok(0)
 }
 
-// ---------------------------------------------------------------------------
-// sys_enter_read — stash fd + timestamp for latency computation
-// ---------------------------------------------------------------------------
-//
-// Tracepoint format:
-//   offset 16: fd    (u64)
-//   offset 24: buf   (u64, user pointer)
-//   offset 32: count (u64)
+macro_rules! io_programs {
+    ($enter:ident, $exit:ident, $kind:expr) => {
+        #[tracepoint]
+        pub fn $enter(ctx: TracePointContext) -> u32 {
+            try_sys_enter_io(&ctx).unwrap_or(0)
+        }
 
-#[tracepoint]
-pub fn sys_enter_read(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_rw(&ctx, true) {
-        Ok(ret) => ret,
-        Err(_) => 0,
-    }
+        #[tracepoint]
+        pub fn $exit(ctx: TracePointContext) -> u32 {
+            try_sys_exit_io(&ctx, $kind).unwrap_or(0)
+        }
+    };
 }
 
-#[tracepoint]
-pub fn sys_enter_write(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_rw(&ctx, false) {
-        Ok(ret) => ret,
-        Err(_) => 0,
-    }
-}
+io_programs!(sys_enter_read, sys_exit_read, EVENT_READ);
+io_programs!(sys_enter_write, sys_exit_write, EVENT_WRITE);
+io_programs!(sys_enter_pread64, sys_exit_pread64, EVENT_READ);
+io_programs!(sys_enter_pwrite64, sys_exit_pwrite64, EVENT_WRITE);
+io_programs!(sys_enter_readv, sys_exit_readv, EVENT_READ);
+io_programs!(sys_enter_writev, sys_exit_writev, EVENT_WRITE);
 
-fn try_sys_enter_rw(ctx: &TracePointContext, _is_read: bool) -> Result<u32, i64> {
+fn try_sys_enter_io(ctx: &TracePointContext) -> Result<u32, i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
     let fd: u64 = unsafe { ctx.read_at(16)? };
-    let ts = unsafe { bpf_ktime_get_ns() };
-
-    // RwArgs is 16 bytes — fits on the 512-byte stack
     let args = RwArgs {
-        ts,
+        ts: unsafe { bpf_ktime_get_ns() },
         fd: fd as u32,
         _pad: 0,
     };
@@ -227,114 +182,142 @@ fn try_sys_enter_rw(ctx: &TracePointContext, _is_read: bool) -> Result<u32, i64>
         record_stash_failure();
         return Err(1);
     }
-
     Ok(0)
 }
 
-// ---------------------------------------------------------------------------
-// sys_exit_read — emit ReadEvent with bytes + latency
-// ---------------------------------------------------------------------------
-//
-// Tracepoint format:
-//   offset 16: ret (i64) — bytes read, or negative errno
-
-#[tracepoint]
-pub fn sys_exit_read(ctx: TracePointContext) -> u32 {
-    match try_sys_exit_rw(&ctx, EVENT_READ) {
-        Ok(ret) => ret,
-        Err(_) => 0,
-    }
-}
-
-#[tracepoint]
-pub fn sys_exit_write(ctx: TracePointContext) -> u32 {
-    match try_sys_exit_rw(&ctx, EVENT_WRITE) {
-        Ok(ret) => ret,
-        Err(_) => 0,
-    }
-}
-
-fn try_sys_exit_rw(ctx: &TracePointContext, kind: u32) -> Result<u32, i64> {
+fn try_sys_exit_io(ctx: &TracePointContext, kind: u32) -> Result<u32, i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
-    let ret: i64 = unsafe { ctx.read_at(16)? };
-
-    // Look up entry stash
+    let result: i64 = unsafe { ctx.read_at(16)? };
     let args = match unsafe { RW_STASH.get(&pid_tgid) } {
-        Some(a) => RwArgs {
-            ts: a.ts,
-            fd: a.fd,
+        Some(args) => RwArgs {
+            ts: args.ts,
+            fd: args.fd,
             _pad: 0,
         },
         None => return Ok(0),
     };
     let _ = RW_STASH.remove(&pid_tgid);
 
-    if ret <= 0 {
+    if result <= 0 {
         return Ok(0);
     }
 
-    let latency_ns = unsafe { bpf_ktime_get_ns() } - args.ts;
-    let tgid = (pid_tgid >> 32) as u32;
-    let tid = pid_tgid as u32;
-
-    // IoEvent is 32 bytes — fits on the stack
     let event = IoEvent {
         kind,
-        pid: tgid,
-        tid,
+        pid: (pid_tgid >> 32) as u32,
+        tid: pid_tgid as u32,
         fd: args.fd,
-        bytes: ret as u64,
-        latency_ns,
+        bytes: result as u64,
+        latency_ns: unsafe { bpf_ktime_get_ns() } - args.ts,
     };
     if EVENTS.output::<IoEvent>(&event, 0).is_err() {
         record_ring_drop();
     }
-
     Ok(0)
 }
 
-// ---------------------------------------------------------------------------
-// sys_enter_close — emit CloseEvent
-// ---------------------------------------------------------------------------
-//
-// Tracepoint format:
-//   offset 16: fd (u64)
-
 #[tracepoint]
 pub fn sys_enter_close(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_close(&ctx) {
-        Ok(ret) => ret,
-        Err(_) => 0,
-    }
+    try_sys_enter_fd(&ctx, &CLOSE_STASH).unwrap_or(0)
 }
 
-fn try_sys_enter_close(ctx: &TracePointContext) -> Result<u32, i64> {
+#[tracepoint]
+pub fn sys_exit_close(ctx: TracePointContext) -> u32 {
+    try_sys_exit_close(&ctx).unwrap_or(0)
+}
+
+fn try_sys_enter_fd(ctx: &TracePointContext, stash: &HashMap<u64, FdArgs>) -> Result<u32, i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
     let fd: u64 = unsafe { ctx.read_at(16)? };
-    let tgid = (pid_tgid >> 32) as u32;
-    let tid = pid_tgid as u32;
+    let args = FdArgs {
+        fd: fd as u32,
+        _pad: 0,
+    };
+    if stash.insert(&pid_tgid, &args, 0).is_err() {
+        record_stash_failure();
+        return Err(1);
+    }
+    Ok(0)
+}
 
-    // Constant zero initialization gets folded into memset, which the BPF
-    // backend cannot lower. A volatile read keeps these as scalar stores.
+fn try_sys_exit_close(ctx: &TracePointContext) -> Result<u32, i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let result: i64 = unsafe { ctx.read_at(16)? };
+    let args = match unsafe { CLOSE_STASH.get(&pid_tgid) } {
+        Some(args) => FdArgs {
+            fd: args.fd,
+            _pad: 0,
+        },
+        None => return Ok(0),
+    };
+    let _ = CLOSE_STASH.remove(&pid_tgid);
+
+    if result != 0 {
+        return Ok(0);
+    }
+
     let zero = unsafe { core::ptr::read_volatile(&0_u64) };
     let event = IoEvent {
         kind: EVENT_CLOSE,
-        pid: tgid,
-        tid,
-        fd: fd as u32,
+        pid: (pid_tgid >> 32) as u32,
+        tid: pid_tgid as u32,
+        fd: args.fd,
         bytes: zero,
         latency_ns: zero,
     };
     if EVENTS.output::<IoEvent>(&event, 0).is_err() {
         record_ring_drop();
     }
-
     Ok(0)
 }
 
-// ---------------------------------------------------------------------------
-// Required boilerplate
-// ---------------------------------------------------------------------------
+macro_rules! dup_programs {
+    ($enter:ident, $exit:ident) => {
+        #[tracepoint]
+        pub fn $enter(ctx: TracePointContext) -> u32 {
+            try_sys_enter_fd(&ctx, &DUP_STASH).unwrap_or(0)
+        }
+
+        #[tracepoint]
+        pub fn $exit(ctx: TracePointContext) -> u32 {
+            try_sys_exit_dup(&ctx).unwrap_or(0)
+        }
+    };
+}
+
+dup_programs!(sys_enter_dup, sys_exit_dup);
+dup_programs!(sys_enter_dup2, sys_exit_dup2);
+dup_programs!(sys_enter_dup3, sys_exit_dup3);
+
+fn try_sys_exit_dup(ctx: &TracePointContext) -> Result<u32, i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let result: i64 = unsafe { ctx.read_at(16)? };
+    let args = match unsafe { DUP_STASH.get(&pid_tgid) } {
+        Some(args) => FdArgs {
+            fd: args.fd,
+            _pad: 0,
+        },
+        None => return Ok(0),
+    };
+    let _ = DUP_STASH.remove(&pid_tgid);
+
+    if result < 0 {
+        return Ok(0);
+    }
+
+    let event = FdEvent {
+        kind: EVENT_DUP,
+        pid: (pid_tgid >> 32) as u32,
+        tid: pid_tgid as u32,
+        old_fd: args.fd,
+        new_fd: result as u32,
+        _pad: 0,
+    };
+    if EVENTS.output::<FdEvent>(&event, 0).is_err() {
+        record_ring_drop();
+    }
+    Ok(0)
+}
 
 #[cfg(not(test))]
 #[panic_handler]

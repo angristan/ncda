@@ -45,12 +45,13 @@ impl AppState {
                     pid,
                     tid: _,
                     fd,
+                    dirfd,
                     path,
                 } => {
                     // Resolve the raw eBPF path via /proc/pid/fd/fd,
                     // giving us the full absolute path even for relative
                     // openat() calls and container processes.
-                    let mut resolved = self.fd_cache.resolve(pid, fd, &path);
+                    let mut resolved = self.fd_cache.resolve(pid, fd, dirfd, &path);
 
                     // Prefix with [container_name] for containerised processes
                     // so they appear grouped in the tree.
@@ -78,8 +79,7 @@ impl AppState {
                     bytes,
                     latency_ns,
                 } => {
-                    if let Some(path) = self.fd_cache.lookup(pid, fd) {
-                        let path = path.to_string();
+                    if let Some(path) = self.resolve_io_path(pid, fd) {
                         if self.is_excluded(&path) {
                             continue;
                         }
@@ -98,8 +98,7 @@ impl AppState {
                     bytes,
                     latency_ns,
                 } => {
-                    if let Some(path) = self.fd_cache.lookup(pid, fd) {
-                        let path = path.to_string();
+                    if let Some(path) = self.resolve_io_path(pid, fd) {
                         if self.is_excluded(&path) {
                             continue;
                         }
@@ -121,8 +120,35 @@ impl AppState {
                     }
                     self.fd_cache.on_close(pid, fd);
                 }
+                BpfEvent::Dup {
+                    pid,
+                    tid: _,
+                    old_fd,
+                    new_fd,
+                } => {
+                    if let Some(path) = self.resolve_io_path(pid, old_fd) {
+                        self.fd_cache.store(pid, new_fd, path);
+                    }
+                }
             }
         }
+    }
+
+    fn resolve_io_path(&mut self, pid: u32, fd: u32) -> Option<String> {
+        if let Some(path) = self.fd_cache.lookup(pid, fd) {
+            return Some(path.to_string());
+        }
+
+        let mut resolved = self.fd_cache.resolve_existing(pid, fd)?;
+        if let Some(name) = self.containers.resolve(pid) {
+            if resolved.starts_with('/') {
+                resolved = format!("[{name}]{resolved}");
+            } else {
+                resolved = format!("[{name}]/{resolved}");
+            }
+        }
+        self.fd_cache.store(pid, fd, resolved.clone());
+        Some(resolved)
     }
 
     fn is_excluded(&self, path: &str) -> bool {
@@ -186,5 +212,43 @@ impl ViewState {
         } else {
             format!("/{}", self.cwd.join("/"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicated_descriptor_keeps_path_attribution() {
+        let mut state = AppState::new(Duration::from_secs(5), Vec::new());
+        let pid = u32::MAX;
+        state.ingest(vec![
+            BpfEvent::Open {
+                pid,
+                tid: pid,
+                fd: 3,
+                dirfd: libc::AT_FDCWD,
+                path: "/tmp/ncda-dup-test".to_string(),
+            },
+            BpfEvent::Dup {
+                pid,
+                tid: pid,
+                old_fd: 3,
+                new_fd: 4,
+            },
+            BpfEvent::Write {
+                pid,
+                tid: pid,
+                fd: 4,
+                bytes: 17,
+                latency_ns: 11,
+            },
+        ]);
+
+        let tmp = state.tree.root.children.get("tmp").unwrap();
+        let file = tmp.children.get("ncda-dup-test").unwrap();
+        assert_eq!(file.stats.write_bytes, 17);
+        assert_eq!(state.fd_cache.lookup(pid, 4), Some("/tmp/ncda-dup-test"));
     }
 }
