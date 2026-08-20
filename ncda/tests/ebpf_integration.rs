@@ -170,6 +170,19 @@ async fn captures_extended_fd_lifecycle_without_loss() {
         },
     ];
     assert_eq!(unsafe { libc::readv(fd, read_parts.as_mut_ptr(), 2) }, 8);
+    assert_eq!(unsafe { libc::pwritev(fd, write_parts.as_ptr(), 2, 0) }, 8);
+    assert_eq!(
+        unsafe { libc::preadv(fd, read_parts.as_mut_ptr(), 2, 0) },
+        8
+    );
+    assert_eq!(
+        unsafe { libc::pwritev2(fd, write_parts.as_ptr(), 2, 0, 0) },
+        8
+    );
+    assert_eq!(
+        unsafe { libc::preadv2(fd, read_parts.as_mut_ptr(), 2, 0, 0) },
+        8
+    );
 
     assert_eq!(
         unsafe { libc::pwrite(preexisting_fd, DATA.as_ptr().cast(), 8, 0) },
@@ -259,8 +272,8 @@ async fn captures_extended_fd_lifecycle_without_loss() {
             _ => {}
         }
     }
-    assert_eq!((read_ops, read_bytes), (4, 32));
-    assert_eq!((write_ops, write_bytes), (4, 32));
+    assert_eq!((read_ops, read_bytes), (6, 48));
+    assert_eq!((write_ops, write_bytes), (6, 48));
     assert_eq!(dup_targets, HashSet::from([dup_fd as u32, 1001, 1002]));
     assert_eq!(closes, known_fds);
 
