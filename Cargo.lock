@@ -515,6 +515,8 @@ dependencies = [
  "log",
  "ncda-common",
  "ratatui",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

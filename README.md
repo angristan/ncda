@@ -26,3 +26,17 @@ cargo build --release
 Requires `nightly-2026-08-04` with `rust-src` and `bpf-linker`. The nightly is pinned because its LLVM 22 bitcode matches `bpf-linker` 0.11 on Arch; LLVM bitcode is not forward-compatible across major versions.
 
 ncda uses the global raw syscall tracepoints with compile-time register and syscall-number decoders for x86_64 and arm64. Arm64 has no native `dup2`; libc uses `dup3` instead.
+
+## Benchmarking
+
+`ncda-bench` runs deterministic positional file I/O while observing the same process. It reports sustained capture throughput, exact event and byte recall, syscall latency, kernel-to-userspace delivery latency, tracepoint coverage, and every loss counter as JSON.
+
+```bash
+cargo build --release --locked --bin ncda-bench
+sudo ./target/release/ncda-bench \
+  --warmup-seconds 2 --duration-seconds 30 \
+  --threads 1 --mode mixed --block-size 4096 \
+  --output ncda-benchmark.json
+```
+
+Use `--mode read`, `--mode write`, and `--mode mixed` as separate profiles. Run at least five repetitions per profile on an otherwise idle host. Do not compare runs with non-zero drops or recall below `1.0`. Delivery percentiles use at most the first one million measured events to bound benchmark memory.

@@ -1,10 +1,3 @@
-mod bpf;
-mod container;
-mod model;
-mod process;
-mod rate;
-mod tui;
-
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,8 +9,9 @@ use clap::Parser;
 use log::{debug, info, warn};
 use tokio::sync::{mpsc, watch};
 
-use crate::bpf::{BpfEvent, ReaderDropCounters};
-use crate::tui::app::AppState;
+use ncda::bpf::{self, BpfEvent, ReaderDropCounters};
+use ncda::tui::app::AppState;
+use ncda::{model, tui};
 
 #[derive(Debug, Parser)]
 #[clap(
@@ -256,9 +250,9 @@ async fn run_stdout_mode(state: Arc<Mutex<AppState>>) -> Result<()> {
                     "Events:{:>8} | Drops:{:>6} | R:{:>10} W:{:>10} | Ops:{:>8} | FDs cached:{:>6}",
                     s.total_events,
                     s.dropped_events,
-                    crate::tui::footer::format_bytes(root.agg_stats.read_bytes),
-                    crate::tui::footer::format_bytes(root.agg_stats.write_bytes),
-                    crate::tui::footer::format_count(root.agg_stats.total_ops()),
+                    ncda::tui::footer::format_bytes(root.agg_stats.read_bytes),
+                    ncda::tui::footer::format_bytes(root.agg_stats.write_bytes),
+                    ncda::tui::footer::format_count(root.agg_stats.total_ops()),
                     s.fd_cache.len(),
                 );
 
@@ -269,9 +263,9 @@ async fn run_stdout_mode(state: Arc<Mutex<AppState>>) -> Result<()> {
                     println!(
                         "  /{:<30} R:{:>8} W:{:>8} Ops:{:>6}",
                         if child.is_dir { format!("{}/", child.name) } else { child.name.clone() },
-                        crate::tui::footer::format_bytes(stats.read_bytes),
-                        crate::tui::footer::format_bytes(stats.write_bytes),
-                        crate::tui::footer::format_count(stats.total_ops()),
+                        ncda::tui::footer::format_bytes(stats.read_bytes),
+                        ncda::tui::footer::format_bytes(stats.write_bytes),
+                        ncda::tui::footer::format_count(stats.total_ops()),
                     );
                 }
                 println!();

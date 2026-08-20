@@ -31,6 +31,12 @@ pub struct ContainerResolver {
     last_discovery: Instant,
 }
 
+impl Default for ContainerResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ContainerResolver {
     pub fn new() -> Self {
         let mut r = Self {

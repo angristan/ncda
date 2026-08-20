@@ -14,6 +14,12 @@ pub struct ProcessTable {
     pub processes: HashMap<u32, ProcessInfo>,
 }
 
+impl Default for ProcessTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProcessTable {
     pub fn new() -> Self {
         Self {
