@@ -23,5 +23,7 @@ fn main() -> anyhow::Result<()> {
             .as_str(),
         ..Default::default()
     };
-    aya_build::build_ebpf([ebpf_package], Toolchain::default())
+    // Arch's bpf-linker 0.11 is linked against LLVM 22. Keep the eBPF
+    // compiler on the same LLVM major; newer LLVM bitcode is not compatible.
+    aya_build::build_ebpf([ebpf_package], Toolchain::Custom("nightly-2026-08-04"))
 }

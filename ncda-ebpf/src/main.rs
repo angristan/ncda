@@ -266,13 +266,16 @@ fn try_sys_enter_close(ctx: &TracePointContext) -> Result<u32, i64> {
     let tgid = (pid_tgid >> 32) as u32;
     let tid = pid_tgid as u32;
 
+    // Constant zero initialization gets folded into memset, which the BPF
+    // backend cannot lower. A volatile read keeps these as scalar stores.
+    let zero = unsafe { core::ptr::read_volatile(&0_u64) };
     let event = IoEvent {
         kind: EVENT_CLOSE,
         pid: tgid,
         tid,
         fd: fd as u32,
-        bytes: 0,
-        latency_ns: 0,
+        bytes: zero,
+        latency_ns: zero,
     };
     EVENTS.output::<IoEvent>(&event, 0).ok();
 

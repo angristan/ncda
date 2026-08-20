@@ -5,6 +5,7 @@ mod process;
 mod rate;
 mod tui;
 
+use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,14 +13,17 @@ use anyhow::Result;
 use aya::maps::RingBuf;
 use aya::Ebpf;
 use clap::Parser;
-use log::{debug, info, warn};
+use log::{debug, info};
 use tokio::sync::mpsc;
 
 use crate::bpf::BpfEvent;
 use crate::tui::app::AppState;
 
 #[derive(Debug, Parser)]
-#[clap(name = "ncda", about = "Real-time file access monitor (ncdu for live I/O)")]
+#[clap(
+    name = "ncda",
+    about = "Real-time file access monitor (ncdu for live I/O)"
+)]
 struct Cli {
     /// Rolling rate window in seconds.
     #[clap(long, default_value = "5")]
@@ -62,20 +66,18 @@ async fn main() -> Result<()> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
-    // Load eBPF bytecode
+    // Load eBPF bytecode. The programs do not emit Aya log records, so no
+    // kernel logger map or userspace logger task is needed.
     info!("loading eBPF programs...");
     let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/ncda"
-    )))?;
+    )))
+    .map_err(anyhow::Error::from)
+    .map_err(add_ebpf_permission_hint)?;
 
-    // Initialize eBPF logger (internally spawns tokio tasks to read log events)
-    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-        warn!("failed to initialize eBPF logger: {e}");
-    }
-
-    // Attach tracepoints
-    bpf::load_and_attach(&mut ebpf)?;
+    // Attach tracepoints.
+    bpf::load_and_attach(&mut ebpf).map_err(add_ebpf_permission_hint)?;
     info!("all eBPF programs attached");
 
     // Take ownership of the ring buffer map so it can be moved into a 'static task
@@ -111,6 +113,26 @@ async fn main() -> Result<()> {
         // TUI mode
         run_tui_mode(state)
     }
+}
+
+fn add_ebpf_permission_hint(error: anyhow::Error) -> anyhow::Error {
+    let permission_denied = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+    });
+
+    if !permission_denied {
+        return error;
+    }
+
+    let program = std::env::args_os()
+        .next()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "ncda".to_string());
+    error.context(format!(
+        "insufficient permissions to initialize eBPF; ncda requires root or suitable eBPF capabilities\nTry: sudo {program}"
+    ))
 }
 
 /// Run in stdout mode — prints a periodic summary to the terminal.
@@ -161,4 +183,27 @@ async fn run_stdout_mode(state: Arc<Mutex<AppState>>) -> Result<()> {
 /// Run the interactive TUI.
 fn run_tui_mode(state: Arc<Mutex<AppState>>) -> Result<()> {
     tui::run(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ebpf_permission_errors_include_sudo_hint() {
+        let error = io::Error::from_raw_os_error(libc::EPERM).into();
+        let message = format!("{:#}", add_ebpf_permission_hint(error));
+
+        assert!(message.contains("insufficient permissions to initialize eBPF"));
+        assert!(message.contains("Try: sudo"));
+        assert!(message.contains("Operation not permitted"));
+    }
+
+    #[test]
+    fn other_ebpf_errors_are_unchanged() {
+        let error = anyhow::anyhow!("invalid eBPF object");
+        let message = format!("{:#}", add_ebpf_permission_hint(error));
+
+        assert_eq!(message, "invalid eBPF object");
+    }
 }

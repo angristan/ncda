@@ -6,9 +6,9 @@ Built with [Aya](https://aya-rs.dev/) and [Ratatui](https://ratatui.rs/).
 
 ## Requirements
 
-- Linux 6.1+
+- Linux 6.1+ on x86_64
 - Root privileges (eBPF needs `CAP_BPF`)
-- Rust nightly + `bpf-linker` (for building)
+- Rust nightly `nightly-2026-08-04` + `bpf-linker` (for building)
 
 ## Usage
 
@@ -23,4 +23,4 @@ sudo ncda --stdout # periodic text summary
 cargo build --release
 ```
 
-Requires Rust nightly, `bpf-linker`, and `rust-src`.
+Requires `nightly-2026-08-04` with `rust-src` and `bpf-linker`. The nightly is pinned because its LLVM 22 bitcode matches `bpf-linker` 0.11 on Arch; LLVM bitcode is not forward-compatible across major versions.
