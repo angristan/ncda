@@ -25,4 +25,4 @@ cargo build --release
 
 Requires `nightly-2026-08-04` with `rust-src` and `bpf-linker`. The nightly is pinned because its LLVM 22 bitcode matches `bpf-linker` 0.11 on Arch; LLVM bitcode is not forward-compatible across major versions.
 
-ncda uses named syscall tracepoints whose normalized field layout is shared by x86_64 and arm64. It validates every required field before attachment. `dup2` is optional on arm64, where libc uses `dup3` instead.
+ncda uses the global raw syscall tracepoints with compile-time register and syscall-number decoders for x86_64 and arm64. Arm64 has no native `dup2`; libc uses `dup3` instead.

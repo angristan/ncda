@@ -12,7 +12,7 @@ pub const EVENT_DUP: u32 = 5;
 
 /// Open event — includes the filename captured at openat() time.
 /// Sent from eBPF to userspace via RingBuf.
-/// Size: 24 + 256 = 280 bytes.
+/// Size: 32 + 256 = 288 bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct OpenEvent {
@@ -22,6 +22,7 @@ pub struct OpenEvent {
     pub fd: u32,
     pub fname_len: u32,
     pub dirfd: i32,
+    pub emitted_ns: u64,
     pub fname: [u8; MAX_FNAME_LEN],
 }
 
@@ -30,7 +31,7 @@ unsafe impl aya::Pod for OpenEvent {}
 
 /// I/O event — used for Read, Write, and Close events.
 /// Sent from eBPF to userspace via RingBuf.
-/// Size: 32 bytes.
+/// Size: 40 bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct IoEvent {
@@ -40,6 +41,7 @@ pub struct IoEvent {
     pub fd: u32,
     pub bytes: u64,
     pub latency_ns: u64,
+    pub emitted_ns: u64,
 }
 
 #[cfg(feature = "user")]
@@ -55,6 +57,7 @@ pub struct FdEvent {
     pub old_fd: u32,
     pub new_fd: u32,
     pub _pad: u32,
+    pub emitted_ns: u64,
 }
 
 #[cfg(feature = "user")]
@@ -77,7 +80,7 @@ pub struct OpenArgs {
 pub struct RwArgs {
     pub ts: u64,
     pub fd: u32,
-    pub _pad: u32,
+    pub kind: u32,
 }
 
 /// Stash for close and dup entry → exit correlation.
@@ -95,6 +98,10 @@ pub struct CaptureStats {
     pub ring_output_drops: u64,
     pub stash_update_failures: u64,
     pub scratch_failures: u64,
+    pub read_entries: u64,
+    pub write_entries: u64,
+    pub read_exits: u64,
+    pub write_exits: u64,
 }
 
 #[cfg(feature = "user")]
@@ -102,7 +109,7 @@ unsafe impl aya::Pod for CaptureStats {}
 
 // The ring-buffer ABI must be identical in eBPF and userspace builds on every
 // supported architecture.
-const _: [(); 280] = [(); core::mem::size_of::<OpenEvent>()];
-const _: [(); 32] = [(); core::mem::size_of::<IoEvent>()];
-const _: [(); 24] = [(); core::mem::size_of::<FdEvent>()];
-const _: [(); 24] = [(); core::mem::size_of::<CaptureStats>()];
+const _: [(); 288] = [(); core::mem::size_of::<OpenEvent>()];
+const _: [(); 40] = [(); core::mem::size_of::<IoEvent>()];
+const _: [(); 32] = [(); core::mem::size_of::<FdEvent>()];
+const _: [(); 56] = [(); core::mem::size_of::<CaptureStats>()];

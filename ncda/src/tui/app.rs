@@ -47,6 +47,7 @@ impl AppState {
                     fd,
                     dirfd,
                     path,
+                    emitted_ns: _,
                 } => {
                     // Resolve the raw eBPF path via /proc/pid/fd/fd,
                     // giving us the full absolute path even for relative
@@ -78,6 +79,7 @@ impl AppState {
                     fd,
                     bytes,
                     latency_ns,
+                    emitted_ns: _,
                 } => {
                     if let Some(path) = self.resolve_io_path(pid, fd) {
                         if self.is_excluded(&path) {
@@ -97,6 +99,7 @@ impl AppState {
                     fd,
                     bytes,
                     latency_ns,
+                    emitted_ns: _,
                 } => {
                     if let Some(path) = self.resolve_io_path(pid, fd) {
                         if self.is_excluded(&path) {
@@ -110,7 +113,12 @@ impl AppState {
                         self.event_log.record(path, bytes);
                     }
                 }
-                BpfEvent::Close { pid, tid: _, fd } => {
+                BpfEvent::Close {
+                    pid,
+                    tid: _,
+                    fd,
+                    emitted_ns: _,
+                } => {
                     if let Some(path) = self.fd_cache.lookup(pid, fd) {
                         let path = path.to_string();
                         if !self.is_excluded(&path) {
@@ -125,6 +133,7 @@ impl AppState {
                     tid: _,
                     old_fd,
                     new_fd,
+                    emitted_ns: _,
                 } => {
                     if let Some(path) = self.resolve_io_path(pid, old_fd) {
                         self.fd_cache.store(pid, new_fd, path);
@@ -190,6 +199,12 @@ pub struct ViewState {
     pub show_help: bool,
 }
 
+impl Default for ViewState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ViewState {
     pub fn new() -> Self {
         Self {
@@ -230,12 +245,14 @@ mod tests {
                 fd: 3,
                 dirfd: libc::AT_FDCWD,
                 path: "/tmp/ncda-dup-test".to_string(),
+                emitted_ns: 1,
             },
             BpfEvent::Dup {
                 pid,
                 tid: pid,
                 old_fd: 3,
                 new_fd: 4,
+                emitted_ns: 2,
             },
             BpfEvent::Write {
                 pid,
@@ -243,6 +260,7 @@ mod tests {
                 fd: 4,
                 bytes: 17,
                 latency_ns: 11,
+                emitted_ns: 3,
             },
         ]);
 

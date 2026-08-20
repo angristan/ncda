@@ -13,3 +13,6 @@ which = { workspace = true }
 [[bin]]
 name = "ncda"
 path = "src/main.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bpf_target_arch, values("x86_64", "aarch64"))'] }
