@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::time::Instant;
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -12,9 +11,7 @@ use crate::process::ProcessTable;
 use crate::rate::EventLog;
 use crate::tui::filter::{filtered_stats, join_path, FilterQuery};
 use crate::tui::footer::{format_bytes, format_bytes_raw, format_count, format_latency};
-use crate::tui::layout::{
-    activity_cell, activity_sparkline_width, fit_display, TableColumns, WidthProfile,
-};
+use crate::tui::layout::{activity_cell, fit_display, TableColumns, WidthProfile};
 
 pub struct TreeLine {
     pub depth: usize,
@@ -134,8 +131,6 @@ pub fn draw(
     }
 
     let columns = TableColumns::for_width(area.width);
-    let history_now = Instant::now();
-    let history_buckets = activity_sparkline_width(columns.graph);
     let tree_name_width = columns.name + 2;
     let max_bytes = lines
         .iter()
@@ -190,16 +185,9 @@ pub fn draw(
             ];
             match columns.profile {
                 WidthProfile::Full => {
-                    let history = event_log.sparkline_for_prefix_at(
-                        &line.display_path,
-                        history_buckets,
-                        filter,
-                        processes,
-                        history_now,
-                    );
                     spans.extend([
                         Span::styled(
-                            activity_cell(line.total_bytes, max_bytes, &history, columns.graph),
+                            activity_cell(line.total_bytes, max_bytes, columns.graph),
                             style.fg(Color::Cyan),
                         ),
                         Span::styled(
@@ -219,16 +207,9 @@ pub fn draw(
                     ]);
                 }
                 WidthProfile::Compact => {
-                    let history = event_log.sparkline_for_prefix_at(
-                        &line.display_path,
-                        history_buckets,
-                        filter,
-                        processes,
-                        history_now,
-                    );
                     spans.extend([
                         Span::styled(
-                            activity_cell(line.total_bytes, max_bytes, &history, columns.graph),
+                            activity_cell(line.total_bytes, max_bytes, columns.graph),
                             style.fg(Color::Cyan),
                         ),
                         Span::styled(

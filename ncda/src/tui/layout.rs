@@ -53,46 +53,8 @@ impl TableColumns {
     }
 }
 
-pub fn activity_sparkline_width(width: usize) -> usize {
-    if width < 8 {
-        return 0;
-    }
-    let bar_width = (width / 3).clamp(3, 8);
-    width.saturating_sub(bar_width + 1)
-}
-
-pub fn activity_cell(total: u64, maximum: u64, samples: &[u64], width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let spark_width = activity_sparkline_width(width);
-    let bar_width = width.saturating_sub(spark_width + usize::from(spark_width > 0));
-    let mut cell = byte_bar(total, maximum, bar_width);
-    if spark_width > 0 {
-        cell.push(' ');
-        cell.push_str(&sparkline(samples, spark_width));
-    }
-    fit_display(&cell, width)
-}
-
-pub fn sparkline(samples: &[u64], width: usize) -> String {
-    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    if width == 0 {
-        return String::new();
-    }
-    let start = samples.len().saturating_sub(width);
-    let visible = &samples[start..];
-    let maximum = visible.iter().copied().max().unwrap_or(0);
-    let mut output = " ".repeat(width.saturating_sub(visible.len()));
-    for value in visible {
-        if *value == 0 || maximum == 0 {
-            output.push(' ');
-        } else {
-            let level = ((*value as u128 * (LEVELS.len() - 1) as u128) / maximum as u128) as usize;
-            output.push(LEVELS[level]);
-        }
-    }
-    output
+pub fn activity_cell(total: u64, maximum: u64, width: usize) -> String {
+    byte_bar(total, maximum, width)
 }
 
 fn byte_bar(total: u64, maximum: u64, width: usize) -> String {
@@ -160,18 +122,9 @@ mod tests {
     }
 
     #[test]
-    fn sparkline_resolution_grows_with_activity_width() {
-        assert_eq!(activity_sparkline_width(7), 0);
-        assert_eq!(activity_sparkline_width(8), 4);
-        assert_eq!(activity_sparkline_width(20), 13);
-        assert_eq!(activity_sparkline_width(30), 21);
-    }
-
-    #[test]
-    fn sparklines_scale_and_pad() {
-        assert_eq!(sparkline(&[0, 0], 4), "    ");
-        assert_eq!(sparkline(&[0, 8, 0, 4], 4), " █ ▄");
-        assert_eq!(sparkline(&[1, 2, 4, 8], 4), "▁▂▄█");
-        assert_eq!(activity_cell(5, 10, &[1; 21], 30).chars().count(), 30);
+    fn activity_bars_fill_the_available_width() {
+        assert_eq!(activity_cell(0, 10, 4), "░░░░");
+        assert_eq!(activity_cell(5, 10, 4), "██░░");
+        assert_eq!(activity_cell(10, 10, 4), "████");
     }
 }
