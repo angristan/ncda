@@ -99,3 +99,10 @@ pub struct CaptureStats {
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for CaptureStats {}
+
+// The ring-buffer ABI must be identical in eBPF and userspace builds on every
+// supported architecture.
+const _: [(); 280] = [(); core::mem::size_of::<OpenEvent>()];
+const _: [(); 32] = [(); core::mem::size_of::<IoEvent>()];
+const _: [(); 24] = [(); core::mem::size_of::<FdEvent>()];
+const _: [(); 24] = [(); core::mem::size_of::<CaptureStats>()];

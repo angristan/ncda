@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use aya::maps::{MapData, PerCpuArray, RingBuf};
 use aya::programs::TracePoint;
 use aya::Ebpf;
-use log::{debug, info};
+use log::{debug, info, warn};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, watch};
 
@@ -94,48 +94,188 @@ pub fn capture_stats(map: &PerCpuArray<MapData, CaptureStats>) -> Result<Capture
         }))
 }
 
-/// Load the eBPF programs and attach to tracepoints.
+#[derive(Clone, Copy)]
+struct TracepointSpec {
+    program: &'static str,
+    tracepoint: &'static str,
+}
+
+macro_rules! tracepoint_spec {
+    ($name:literal) => {
+        TracepointSpec {
+            program: $name,
+            tracepoint: $name,
+        }
+    };
+}
+
+const TRACEPOINTS: &[TracepointSpec] = &[
+    tracepoint_spec!("sys_enter_openat"),
+    tracepoint_spec!("sys_exit_openat"),
+    tracepoint_spec!("sys_enter_openat2"),
+    tracepoint_spec!("sys_exit_openat2"),
+    tracepoint_spec!("sys_enter_read"),
+    tracepoint_spec!("sys_exit_read"),
+    tracepoint_spec!("sys_enter_write"),
+    tracepoint_spec!("sys_exit_write"),
+    tracepoint_spec!("sys_enter_pread64"),
+    tracepoint_spec!("sys_exit_pread64"),
+    tracepoint_spec!("sys_enter_pwrite64"),
+    tracepoint_spec!("sys_exit_pwrite64"),
+    tracepoint_spec!("sys_enter_readv"),
+    tracepoint_spec!("sys_exit_readv"),
+    tracepoint_spec!("sys_enter_writev"),
+    tracepoint_spec!("sys_exit_writev"),
+    tracepoint_spec!("sys_enter_close"),
+    tracepoint_spec!("sys_exit_close"),
+    tracepoint_spec!("sys_enter_dup"),
+    tracepoint_spec!("sys_exit_dup"),
+    tracepoint_spec!("sys_enter_dup2"),
+    tracepoint_spec!("sys_exit_dup2"),
+    tracepoint_spec!("sys_enter_dup3"),
+    tracepoint_spec!("sys_exit_dup3"),
+];
+
+/// Load the eBPF programs and attach to architecture-neutral named syscall
+/// tracepoints. Linux exposes syscall arguments as normalized eight-byte
+/// fields on both x86_64 and arm64; validate that contract before loading.
 pub fn load_and_attach(ebpf: &mut Ebpf) -> Result<()> {
-    // Attach tracepoints for syscall enter/exit
-    let tracepoints = [
-        ("sys_enter_openat", "syscalls", "sys_enter_openat"),
-        ("sys_exit_openat", "syscalls", "sys_exit_openat"),
-        ("sys_enter_openat2", "syscalls", "sys_enter_openat2"),
-        ("sys_exit_openat2", "syscalls", "sys_exit_openat2"),
-        ("sys_enter_read", "syscalls", "sys_enter_read"),
-        ("sys_exit_read", "syscalls", "sys_exit_read"),
-        ("sys_enter_write", "syscalls", "sys_enter_write"),
-        ("sys_exit_write", "syscalls", "sys_exit_write"),
-        ("sys_enter_pread64", "syscalls", "sys_enter_pread64"),
-        ("sys_exit_pread64", "syscalls", "sys_exit_pread64"),
-        ("sys_enter_pwrite64", "syscalls", "sys_enter_pwrite64"),
-        ("sys_exit_pwrite64", "syscalls", "sys_exit_pwrite64"),
-        ("sys_enter_readv", "syscalls", "sys_enter_readv"),
-        ("sys_exit_readv", "syscalls", "sys_exit_readv"),
-        ("sys_enter_writev", "syscalls", "sys_enter_writev"),
-        ("sys_exit_writev", "syscalls", "sys_exit_writev"),
-        ("sys_enter_close", "syscalls", "sys_enter_close"),
-        ("sys_exit_close", "syscalls", "sys_exit_close"),
-        ("sys_enter_dup", "syscalls", "sys_enter_dup"),
-        ("sys_exit_dup", "syscalls", "sys_exit_dup"),
-        ("sys_enter_dup2", "syscalls", "sys_enter_dup2"),
-        ("sys_exit_dup2", "syscalls", "sys_exit_dup2"),
-        ("sys_enter_dup3", "syscalls", "sys_enter_dup3"),
-        ("sys_exit_dup3", "syscalls", "sys_exit_dup3"),
-    ];
+    let mut attached = 0usize;
+    for spec in TRACEPOINTS {
+        if let Err(error) = validate_tracepoint_layout(spec.tracepoint) {
+            let optional_dup2 = cfg!(target_arch = "aarch64")
+                && spec.tracepoint.ends_with("dup2")
+                && error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                });
+            if optional_dup2 {
+                warn!(
+                    "{} is unavailable on arm64; dup3 still provides equivalent coverage",
+                    spec.tracepoint
+                );
+                continue;
+            }
+            return Err(error);
+        }
 
-    for (prog_name, category, tp_name) in &tracepoints {
         let program: &mut TracePoint = ebpf
-            .program_mut(prog_name)
-            .with_context(|| format!("program {prog_name} not found"))?
+            .program_mut(spec.program)
+            .with_context(|| format!("program {} not found", spec.program))?
             .try_into()
-            .with_context(|| format!("failed to get program {prog_name}"))?;
+            .with_context(|| format!("failed to get program {}", spec.program))?;
         program.load()?;
-        program.attach(category, tp_name)?;
-        info!("attached {prog_name} to {category}/{tp_name}");
+        program.attach("syscalls", spec.tracepoint)?;
+        attached += 1;
+        info!("attached {} to syscalls/{}", spec.program, spec.tracepoint);
     }
-
+    info!("attached {attached} portable syscall tracepoints");
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceField {
+    name: String,
+    offset: usize,
+    size: usize,
+}
+
+fn validate_tracepoint_layout(tracepoint: &str) -> Result<()> {
+    let format = read_tracepoint_format(tracepoint)
+        .with_context(|| format!("read format for syscalls/{tracepoint}"))?;
+    validate_tracepoint_format(tracepoint, &format)
+}
+
+fn read_tracepoint_format(tracepoint: &str) -> std::io::Result<String> {
+    let mut last_error = None;
+    for root in ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"] {
+        let path = format!("{root}/events/syscalls/{tracepoint}/format");
+        match std::fs::read_to_string(path) {
+            Ok(format) => return Ok(format),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound)))
+}
+
+fn validate_tracepoint_format(tracepoint: &str, format: &str) -> Result<()> {
+    let fields = parse_tracepoint_fields(format);
+    require_trace_field(tracepoint, &fields, "__syscall_nr", 8, 4)?;
+
+    if tracepoint.starts_with("sys_exit_") {
+        require_trace_field(tracepoint, &fields, "ret", 16, 8)?;
+    } else {
+        require_field_at(tracepoint, &fields, 16, 8)?;
+        if tracepoint == "sys_enter_openat" || tracepoint == "sys_enter_openat2" {
+            require_field_at(tracepoint, &fields, 24, 8)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_tracepoint_fields(format: &str) -> Vec<TraceField> {
+    format
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let mut parts = line.strip_prefix("field:")?.split(';');
+            let declaration = parts.next()?.trim();
+            let offset = parts
+                .find_map(|part| part.trim().strip_prefix("offset:"))?
+                .parse()
+                .ok()?;
+            let size = line
+                .split(';')
+                .find_map(|part| part.trim().strip_prefix("size:"))?
+                .parse()
+                .ok()?;
+            let name = declaration
+                .split_whitespace()
+                .last()?
+                .trim_start_matches('*')
+                .split('[')
+                .next()?
+                .to_string();
+            Some(TraceField { name, offset, size })
+        })
+        .collect()
+}
+
+fn require_trace_field(
+    tracepoint: &str,
+    fields: &[TraceField],
+    name: &str,
+    offset: usize,
+    size: usize,
+) -> Result<()> {
+    if fields
+        .iter()
+        .any(|field| field.name == name && field.offset == offset && field.size == size)
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "syscalls/{tracepoint} has incompatible field {name}; expected offset {offset}, size {size}"
+    )
+}
+
+fn require_field_at(
+    tracepoint: &str,
+    fields: &[TraceField],
+    offset: usize,
+    size: usize,
+) -> Result<()> {
+    if fields
+        .iter()
+        .any(|field| field.offset == offset && field.size == size)
+    {
+        return Ok(());
+    }
+    anyhow::bail!("syscalls/{tracepoint} has no syscall argument at offset {offset}, size {size}")
 }
 
 /// Read events from the ring buffer and send parsed events over a channel.
@@ -258,8 +398,7 @@ fn parse_open_event(data: &[u8]) -> Option<BpfEvent> {
     let fname_bytes = &data[fname_start..fname_end.min(data.len())];
 
     // The filename may be null-terminated
-    let path = core::str::from_utf8(fname_bytes)
-        .unwrap_or("")
+    let path = String::from_utf8_lossy(fname_bytes)
         .trim_end_matches('\0')
         .to_string();
 
@@ -519,6 +658,46 @@ mod tests {
         let resolved = cache.resolve(std::process::id(), u32::MAX, directory.as_raw_fd(), "child");
 
         assert_eq!(resolved, "/tmp/child");
+    }
+
+    #[test]
+    fn tracepoint_layout_validation_accepts_normalized_64_bit_fields() {
+        let enter = "\
+field:unsigned short common_type; offset:0; size:2; signed:0;\n\
+field:int __syscall_nr; offset:8; size:4; signed:1;\n\
+field:int dfd; offset:16; size:8; signed:0;\n\
+field:const char * filename; offset:24; size:8; signed:0;\n";
+        validate_tracepoint_format("sys_enter_openat", enter).unwrap();
+
+        let exit = "\
+field:unsigned short common_type; offset:0; size:2; signed:0;\n\
+field:int __syscall_nr; offset:8; size:4; signed:1;\n\
+field:long ret; offset:16; size:8; signed:1;\n";
+        validate_tracepoint_format("sys_exit_openat", exit).unwrap();
+    }
+
+    #[test]
+    fn tracepoint_layout_validation_rejects_offset_drift() {
+        let format = "\
+field:int __syscall_nr; offset:8; size:4; signed:1;\n\
+field:int dfd; offset:12; size:8; signed:0;\n\
+field:const char * filename; offset:20; size:8; signed:0;\n";
+        let error = validate_tracepoint_format("sys_enter_openat", format).unwrap_err();
+        assert!(error.to_string().contains("offset 16"));
+    }
+
+    #[test]
+    fn parser_lossily_preserves_non_utf8_paths() {
+        let mut open = [0_u8; 280];
+        open[0..4].copy_from_slice(&EVENT_OPEN.to_ne_bytes());
+        open[16..20].copy_from_slice(&3_u32.to_ne_bytes());
+        open[20..24].copy_from_slice(&libc::AT_FDCWD.to_ne_bytes());
+        open[24..27].copy_from_slice(&[b'a', 0xff, b'b']);
+
+        assert!(matches!(
+            parse_event(&open),
+            Some(BpfEvent::Open { ref path, .. }) if path == "a�b"
+        ));
     }
 
     #[test]
