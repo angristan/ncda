@@ -77,7 +77,7 @@ pub fn sparkline(samples: &[u64], width: usize) -> String {
     let maximum = visible.iter().copied().max().unwrap_or(0);
     let mut output = " ".repeat(width.saturating_sub(visible.len()));
     for value in visible {
-        if maximum == 0 {
+        if *value == 0 || maximum == 0 {
             output.push(' ');
         } else {
             let level = ((*value as u128 * (LEVELS.len() - 1) as u128) / maximum as u128) as usize;
@@ -154,9 +154,7 @@ mod tests {
     #[test]
     fn sparklines_scale_and_pad() {
         assert_eq!(sparkline(&[0, 0], 4), "    ");
-        assert_eq!(
-            UnicodeWidthStr::width(sparkline(&[1, 2, 4, 8], 4).as_str()),
-            4
-        );
+        assert_eq!(sparkline(&[0, 8, 0, 4], 4), " █ ▄");
+        assert_eq!(sparkline(&[1, 2, 4, 8], 4), "▁▂▄█");
     }
 }
