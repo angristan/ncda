@@ -6,7 +6,14 @@ use ratatui::Frame;
 
 use crate::model::NodeStats;
 
-pub fn draw(f: &mut Frame, area: Rect, root_stats: &NodeStats, rate_bps: f64, total_events: u64) {
+pub fn draw(
+    f: &mut Frame,
+    area: Rect,
+    root_stats: &NodeStats,
+    rate_bps: f64,
+    total_events: u64,
+    dropped_events: u64,
+) {
     let line = Line::from(vec![
         Span::styled(" R:", Style::default().fg(Color::Cyan)),
         Span::raw(format_bytes(root_stats.read_bytes)),
@@ -20,6 +27,15 @@ pub fn draw(f: &mut Frame, area: Rect, root_stats: &NodeStats, rate_bps: f64, to
         Span::raw(format!("{}/s", format_bytes_raw(rate_bps as u64))),
         Span::raw(" | "),
         Span::raw(format!("Evts:{}", format_count(total_events))),
+        Span::raw(" | "),
+        Span::styled(
+            format!("Drop:{}", format_count(dropped_events)),
+            Style::default().fg(if dropped_events == 0 {
+                Color::DarkGray
+            } else {
+                Color::Red
+            }),
+        ),
         Span::raw(" | "),
         Span::styled("q", Style::default().fg(Color::Yellow)),
         Span::raw(":quit "),

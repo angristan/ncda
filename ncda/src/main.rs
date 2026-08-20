@@ -9,14 +9,14 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Result;
-use aya::maps::RingBuf;
+use anyhow::{Context, Result};
+use aya::maps::{MapData, PerCpuArray, RingBuf};
 use aya::Ebpf;
 use clap::Parser;
-use log::{debug, info};
-use tokio::sync::mpsc;
+use log::{debug, info, warn};
+use tokio::sync::{mpsc, watch};
 
-use crate::bpf::BpfEvent;
+use crate::bpf::{BpfEvent, ReaderDropCounters};
 use crate::tui::app::AppState;
 
 #[derive(Debug, Parser)]
@@ -80,38 +80,137 @@ async fn main() -> Result<()> {
     bpf::load_and_attach(&mut ebpf).map_err(add_ebpf_permission_hint)?;
     info!("all eBPF programs attached");
 
-    // Take ownership of the ring buffer map so it can be moved into a 'static task
-    let ring_buf = RingBuf::try_from(ebpf.take_map("EVENTS").unwrap())?;
+    // Own both maps independently so dropping `ebpf` detaches all producers
+    // before the reader's final drain.
+    let events = ebpf.take_map("EVENTS").context("EVENTS map not found")?;
+    let ring_buf = RingBuf::try_from(events)?;
+    let capture_stats = ebpf
+        .take_map("CAPTURE_STATS")
+        .context("CAPTURE_STATS map not found")?;
+    let capture_stats = PerCpuArray::<_, ncda_common::CaptureStats>::try_from(capture_stats)
+        .context("CAPTURE_STATS has unexpected map type")?;
+    let capture_stats = Arc::new(Mutex::new(capture_stats));
 
     // Shared application state
     let rate_window = Duration::from_secs(cli.rate_window);
     let state = Arc::new(Mutex::new(AppState::new(rate_window, cli.exclude)));
 
-    // Channel: BPF reader → aggregator
+    // Channel: BPF reader → aggregator.
     let (tx, mut rx) = mpsc::channel::<Vec<BpfEvent>>(512);
+    let reader_drops = Arc::new(ReaderDropCounters::default());
+    let (reader_shutdown_tx, reader_shutdown_rx) = watch::channel(false);
+    let reader_handle = tokio::spawn(bpf::reader_loop_polling(
+        ring_buf,
+        tx,
+        reader_shutdown_rx,
+        reader_drops.clone(),
+    ));
 
-    // Spawn BPF reader task
-    tokio::task::spawn(async move {
-        if let Err(e) = bpf::reader_loop_polling(ring_buf, tx).await {
-            log::error!("BPF reader error: {e}");
-        }
-    });
-
-    // Spawn aggregator task
     let agg_state = state.clone();
-    tokio::task::spawn(async move {
+    let aggregator_handle = tokio::spawn(async move {
         while let Some(batch) = rx.recv().await {
-            let mut s = agg_state.lock().unwrap();
-            s.ingest(batch);
+            let mut state = agg_state.lock().unwrap();
+            state.ingest(batch);
         }
     });
 
-    if cli.stdout {
-        // Stdout mode: periodically print a summary
-        run_stdout_mode(state).await
+    // Keep the live drop count visible without reading BPF maps in the draw
+    // path. A final sample is taken after the reader and aggregator stop.
+    let (stats_shutdown_tx, stats_shutdown_rx) = watch::channel(false);
+    let stats_handle = tokio::spawn(monitor_drop_counters(
+        capture_stats,
+        reader_drops,
+        state.clone(),
+        stats_shutdown_rx,
+    ));
+
+    let mode_result = if cli.stdout {
+        run_stdout_mode(state.clone()).await
     } else {
-        // TUI mode
-        run_tui_mode(state)
+        run_tui_mode(state.clone())
+    };
+
+    // Detach first, then drain the ring and aggregate every queued batch.
+    drop(ebpf);
+    let _ = reader_shutdown_tx.send(true);
+    reader_handle.await.context("BPF reader task panicked")??;
+    aggregator_handle
+        .await
+        .context("aggregator task panicked")?;
+
+    let _ = stats_shutdown_tx.send(true);
+    let final_drops = stats_handle
+        .await
+        .context("capture stats task panicked")??;
+    if final_drops.total() > 0 {
+        warn!(
+            "capture lost {} events (ring={}, stash={}, scratch={}, parse={}, queue={})",
+            final_drops.total(),
+            final_drops.ring_output_drops,
+            final_drops.stash_update_failures,
+            final_drops.scratch_failures,
+            final_drops.parse_drops,
+            final_drops.queue_drops,
+        );
+    }
+
+    mode_result
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DropSnapshot {
+    ring_output_drops: u64,
+    stash_update_failures: u64,
+    scratch_failures: u64,
+    parse_drops: u64,
+    queue_drops: u64,
+}
+
+impl DropSnapshot {
+    fn total(self) -> u64 {
+        self.ring_output_drops
+            + self.stash_update_failures
+            + self.scratch_failures
+            + self.parse_drops
+            + self.queue_drops
+    }
+}
+
+async fn monitor_drop_counters(
+    capture_stats: Arc<Mutex<PerCpuArray<MapData, ncda_common::CaptureStats>>>,
+    reader_drops: Arc<ReaderDropCounters>,
+    state: Arc<Mutex<AppState>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<DropSnapshot> {
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+
+    loop {
+        let kernel = {
+            let map = capture_stats.lock().unwrap();
+            bpf::capture_stats(&map).context("read kernel capture counters")?
+        };
+        let reader = reader_drops.snapshot();
+        let snapshot = DropSnapshot {
+            ring_output_drops: kernel.ring_output_drops,
+            stash_update_failures: kernel.stash_update_failures,
+            scratch_failures: kernel.scratch_failures,
+            parse_drops: reader.parse_drops,
+            queue_drops: reader.queue_drops,
+        };
+        state.lock().unwrap().dropped_events = snapshot.total();
+
+        if *shutdown.borrow() {
+            return Ok(snapshot);
+        }
+
+        tokio::select! {
+            _ = interval.tick() => {}
+            result = shutdown.changed() => {
+                if result.is_err() {
+                    return Ok(snapshot);
+                }
+            }
+        }
     }
 }
 
@@ -154,8 +253,9 @@ async fn run_stdout_mode(state: Arc<Mutex<AppState>>) -> Result<()> {
                 let s = state.lock().unwrap();
                 let root = &s.tree.root;
                 println!(
-                    "Events:{:>8} | R:{:>10} W:{:>10} | Ops:{:>8} | FDs cached:{:>6}",
+                    "Events:{:>8} | Drops:{:>6} | R:{:>10} W:{:>10} | Ops:{:>8} | FDs cached:{:>6}",
                     s.total_events,
+                    s.dropped_events,
                     crate::tui::footer::format_bytes(root.agg_stats.read_bytes),
                     crate::tui::footer::format_bytes(root.agg_stats.write_bytes),
                     crate::tui::footer::format_count(root.agg_stats.total_ops()),
@@ -205,5 +305,18 @@ mod tests {
         let message = format!("{:#}", add_ebpf_permission_hint(error));
 
         assert_eq!(message, "invalid eBPF object");
+    }
+
+    #[test]
+    fn drop_snapshot_sums_every_loss_class() {
+        let snapshot = DropSnapshot {
+            ring_output_drops: 1,
+            stash_update_failures: 2,
+            scratch_failures: 3,
+            parse_drops: 4,
+            queue_drops: 5,
+        };
+
+        assert_eq!(snapshot.total(), 15);
     }
 }

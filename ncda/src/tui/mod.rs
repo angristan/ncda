@@ -162,6 +162,7 @@ fn draw(f: &mut ratatui::Frame, state: &AppState, view: &ViewState) {
         &state.tree.root.agg_stats,
         rate,
         state.total_events,
+        state.dropped_events,
     );
 
     // Help overlay

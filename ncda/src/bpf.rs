@@ -1,13 +1,15 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use aya::maps::{MapData, RingBuf};
+use aya::maps::{MapData, PerCpuArray, RingBuf};
 use aya::programs::TracePoint;
 use aya::Ebpf;
 use log::{debug, info};
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use ncda_common::*;
 
@@ -40,6 +42,49 @@ pub enum BpfEvent {
         tid: u32,
         fd: u32,
     },
+}
+
+/// Lock-free counters updated by the ring-buffer reader.
+#[derive(Default)]
+pub struct ReaderDropCounters {
+    parse_drops: AtomicU64,
+    queue_drops: AtomicU64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderDropSnapshot {
+    pub parse_drops: u64,
+    pub queue_drops: u64,
+}
+
+impl ReaderDropCounters {
+    pub fn snapshot(&self) -> ReaderDropSnapshot {
+        ReaderDropSnapshot {
+            parse_drops: self.parse_drops.load(Ordering::Relaxed),
+            queue_drops: self.queue_drops.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_parse_drop(&self) {
+        self.parse_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_queue_drops(&self, count: usize) {
+        self.queue_drops.fetch_add(count as u64, Ordering::Relaxed);
+    }
+}
+
+/// Sum the kernel's per-CPU capture failure counters.
+pub fn capture_stats(map: &PerCpuArray<MapData, CaptureStats>) -> Result<CaptureStats> {
+    let values = map.get(&0, 0)?;
+    Ok(values
+        .iter()
+        .fold(CaptureStats::default(), |mut total, value| {
+            total.ring_output_drops += value.ring_output_drops;
+            total.stash_update_failures += value.stash_update_failures;
+            total.scratch_failures += value.scratch_failures;
+            total
+        }))
 }
 
 /// Load the eBPF programs and attach to tracepoints.
@@ -111,6 +156,8 @@ pub async fn reader_loop(
 pub async fn reader_loop_polling(
     mut ring_buf: RingBuf<MapData>,
     tx: mpsc::Sender<Vec<BpfEvent>>,
+    mut shutdown: watch::Receiver<bool>,
+    drops: Arc<ReaderDropCounters>,
 ) -> Result<()> {
     loop {
         let mut batch = Vec::with_capacity(256);
@@ -119,19 +166,34 @@ pub async fn reader_loop_polling(
             let data: &[u8] = &item;
             if let Some(event) = parse_event(data) {
                 batch.push(event);
+            } else {
+                drops.record_parse_drop();
             }
         }
 
         if !batch.is_empty() {
+            let batch_len = batch.len();
             if tx.send(batch).await.is_err() {
-                break;
+                drops.record_queue_drops(batch_len);
+                return Ok(());
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+        // The caller detaches all producers before setting shutdown, so this
+        // drain observes every record that reached the ring buffer.
+        if *shutdown.borrow() {
+            return Ok(());
+        }
 
-    Ok(())
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            result = shutdown.changed() => {
+                if result.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 /// Parse raw bytes from the ring buffer into a BpfEvent.
@@ -315,5 +377,41 @@ impl FdPathCache {
         }
 
         host_path.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_event_abi_has_expected_sizes() {
+        assert_eq!(core::mem::size_of::<OpenEvent>(), 280);
+        assert_eq!(core::mem::size_of::<IoEvent>(), 32);
+        assert_eq!(core::mem::size_of::<CaptureStats>(), 24);
+    }
+
+    #[test]
+    fn reader_drop_snapshot_tracks_each_loss_class() {
+        let counters = ReaderDropCounters::default();
+        counters.record_parse_drop();
+        counters.record_queue_drops(3);
+
+        assert_eq!(
+            counters.snapshot(),
+            ReaderDropSnapshot {
+                parse_drops: 1,
+                queue_drops: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_records_are_rejected() {
+        assert!(parse_event(&[0; 3]).is_none());
+
+        let mut unknown = [0_u8; 32];
+        unknown[0..4].copy_from_slice(&99_u32.to_ne_bytes());
+        assert!(parse_event(&unknown).is_none());
     }
 }

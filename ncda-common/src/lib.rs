@@ -63,3 +63,15 @@ pub struct RwArgs {
     pub fd: u32,
     pub _pad: u32,
 }
+
+/// Per-CPU kernel capture failure counters.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CaptureStats {
+    pub ring_output_drops: u64,
+    pub stash_update_failures: u64,
+    pub scratch_failures: u64,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for CaptureStats {}

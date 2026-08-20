@@ -36,6 +36,31 @@ static SCRATCH: PerCpuArray<OpenArgs> = PerCpuArray::with_max_entries(1, 0);
 #[map]
 static EVENT_BUF: PerCpuArray<OpenEvent> = PerCpuArray::with_max_entries(1, 0);
 
+/// Per-CPU loss counters avoid synchronization in syscall context.
+#[map]
+static CAPTURE_STATS: PerCpuArray<CaptureStats> = PerCpuArray::with_max_entries(1, 0);
+
+#[inline(always)]
+fn record_ring_drop() {
+    if let Some(stats) = CAPTURE_STATS.get_ptr_mut(0) {
+        unsafe { (*stats).ring_output_drops += 1 };
+    }
+}
+
+#[inline(always)]
+fn record_stash_failure() {
+    if let Some(stats) = CAPTURE_STATS.get_ptr_mut(0) {
+        unsafe { (*stats).stash_update_failures += 1 };
+    }
+}
+
+#[inline(always)]
+fn record_scratch_failure() {
+    if let Some(stats) = CAPTURE_STATS.get_ptr_mut(0) {
+        unsafe { (*stats).scratch_failures += 1 };
+    }
+}
+
 // ---------------------------------------------------------------------------
 // sys_enter_openat — capture filename and stash for exit handler
 // ---------------------------------------------------------------------------
@@ -60,8 +85,14 @@ fn try_sys_enter_openat(ctx: &TracePointContext) -> Result<u32, i64> {
     let filename_ptr: u64 = unsafe { ctx.read_at(24)? };
     let flags: u64 = unsafe { ctx.read_at(32)? };
 
-    // Get scratch buffer (per-CPU, avoids stack overflow)
-    let scratch = SCRATCH.get_ptr_mut(0).ok_or(1i64)?;
+    // Get scratch buffer (per-CPU, avoids stack overflow).
+    let scratch = match SCRATCH.get_ptr_mut(0) {
+        Some(scratch) => scratch,
+        None => {
+            record_scratch_failure();
+            return Err(1);
+        }
+    };
     let args = unsafe { &mut *scratch };
     args.flags = flags as u32;
     args.fname_len = 0;
@@ -72,8 +103,11 @@ fn try_sys_enter_openat(ctx: &TracePointContext) -> Result<u32, i64> {
         Err(_) => args.fname_len = 0,
     }
 
-    // Stash for sys_exit_openat to pick up
-    OPEN_STASH.insert(&pid_tgid, args, 0)?;
+    // Stash for sys_exit_openat to pick up.
+    if OPEN_STASH.insert(&pid_tgid, args, 0).is_err() {
+        record_stash_failure();
+        return Err(1);
+    }
 
     Ok(0)
 }
@@ -114,8 +148,15 @@ fn try_sys_exit_openat(ctx: &TracePointContext) -> Result<u32, i64> {
     let tgid = (pid_tgid >> 32) as u32;
     let tid = pid_tgid as u32;
 
-    // Construct OpenEvent in per-CPU buffer
-    let buf = EVENT_BUF.get_ptr_mut(0).ok_or(1i64)?;
+    // Construct OpenEvent in per-CPU buffer.
+    let buf = match EVENT_BUF.get_ptr_mut(0) {
+        Some(buf) => buf,
+        None => {
+            record_scratch_failure();
+            let _ = OPEN_STASH.remove(&pid_tgid);
+            return Err(1);
+        }
+    };
     let event = unsafe { &mut *buf };
     event.kind = EVENT_OPEN;
     event.pid = tgid;
@@ -135,8 +176,10 @@ fn try_sys_exit_openat(ctx: &TracePointContext) -> Result<u32, i64> {
         i += 1;
     }
 
-    // Output event to ring buffer
-    EVENTS.output::<OpenEvent>(unsafe { &*buf }, 0).ok();
+    // Output event to ring buffer.
+    if EVENTS.output::<OpenEvent>(unsafe { &*buf }, 0).is_err() {
+        record_ring_drop();
+    }
 
     // Clean up stash
     let _ = OPEN_STASH.remove(&pid_tgid);
@@ -180,7 +223,10 @@ fn try_sys_enter_rw(ctx: &TracePointContext, _is_read: bool) -> Result<u32, i64>
         fd: fd as u32,
         _pad: 0,
     };
-    RW_STASH.insert(&pid_tgid, &args, 0)?;
+    if RW_STASH.insert(&pid_tgid, &args, 0).is_err() {
+        record_stash_failure();
+        return Err(1);
+    }
 
     Ok(0)
 }
@@ -240,7 +286,9 @@ fn try_sys_exit_rw(ctx: &TracePointContext, kind: u32) -> Result<u32, i64> {
         bytes: ret as u64,
         latency_ns,
     };
-    EVENTS.output::<IoEvent>(&event, 0).ok();
+    if EVENTS.output::<IoEvent>(&event, 0).is_err() {
+        record_ring_drop();
+    }
 
     Ok(0)
 }
@@ -277,7 +325,9 @@ fn try_sys_enter_close(ctx: &TracePointContext) -> Result<u32, i64> {
         bytes: zero,
         latency_ns: zero,
     };
-    EVENTS.output::<IoEvent>(&event, 0).ok();
+    if EVENTS.output::<IoEvent>(&event, 0).is_err() {
+        record_ring_drop();
+    }
 
     Ok(0)
 }
