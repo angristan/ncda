@@ -40,3 +40,19 @@ sudo ./target/release/ncda-bench \
 ```
 
 Use `--mode read`, `--mode write`, and `--mode mixed` as separate profiles. Run at least five repetitions per profile on an otherwise idle host. Do not compare runs with non-zero drops or recall below `1.0`. Delivery percentiles use at most the first one million measured events to bound benchmark memory.
+
+## Testing
+
+Normal checks never use elevated privileges:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+```
+
+The ignored live-kernel suite validates openat/openat2, scalar, positional and vectored I/O, inherited descriptors, dup/dup2/dup3, close handling, loss counters, and final ring draining. Its wrapper builds as the current user, then runs only the test executable through a sanitized non-interactive sudo environment:
+
+```bash
+scripts/test-ebpf.sh
+```
