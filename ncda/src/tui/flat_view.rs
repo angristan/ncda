@@ -10,7 +10,9 @@ use crate::rate::EventLog;
 use crate::tui::app::ViewState;
 use crate::tui::filter::{filtered_stats, join_path, FilterQuery};
 use crate::tui::footer::{format_bytes, format_bytes_raw, format_count, format_latency};
-use crate::tui::layout::{activity_cell, fit_display, TableColumns, WidthProfile};
+use crate::tui::layout::{
+    activity_cell, fit_display, highlight_selected, TableColumns, WidthProfile,
+};
 
 #[derive(Debug, Clone)]
 pub struct FlatRow {
@@ -117,13 +119,8 @@ pub fn draw(
             } else {
                 "0B/s".to_string()
             };
-            let style = if index == view.cursor {
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
+            let selected = index == view.cursor;
+            let style = Style::default();
             let mut spans = vec![
                 Span::styled(prefix, style),
                 Span::styled(
@@ -175,6 +172,9 @@ pub fn draw(
                     format!("  {:>8}", format_bytes(row.stats.total_bytes())),
                     style.fg(Color::Yellow),
                 )),
+            }
+            if selected {
+                highlight_selected(&mut spans);
             }
             ListItem::new(Line::from(spans))
         })

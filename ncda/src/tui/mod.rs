@@ -328,18 +328,12 @@ fn draw_process_panel(
         .map(|(offset, p)| {
             let index = start + offset;
             let selected = view.focus == PaneFocus::Processes && index == view.process_cursor;
-            let style = if selected {
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
+            let style = Style::default();
             let identity = match &p.container {
                 Some(container) => format!("{}@{container}", p.comm),
                 None => p.comm.clone(),
             };
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!("{:>6} ", p.pid), style.fg(Color::Yellow)),
                 Span::styled(
                     format!("{} ", layout::fit_display(&identity, comm_width)),
@@ -354,7 +348,11 @@ fn draw_process_panel(
                     format!("W:{:>6}", footer::format_bytes(p.stats.write_bytes)),
                     style.fg(Color::Red),
                 ),
-            ])
+            ];
+            if selected {
+                layout::highlight_selected(&mut spans);
+            }
+            Line::from(spans)
         })
         .collect();
 

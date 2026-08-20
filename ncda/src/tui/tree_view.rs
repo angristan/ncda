@@ -11,7 +11,9 @@ use crate::process::ProcessTable;
 use crate::rate::EventLog;
 use crate::tui::filter::{filtered_stats, join_path, FilterQuery};
 use crate::tui::footer::{format_bytes, format_bytes_raw, format_count, format_latency};
-use crate::tui::layout::{activity_cell, fit_display, TableColumns, WidthProfile};
+use crate::tui::layout::{
+    activity_cell, fit_display, highlight_selected, TableColumns, WidthProfile,
+};
 
 pub struct TreeLine {
     pub depth: usize,
@@ -158,13 +160,8 @@ pub fn draw(
                 line.name.clone()
             };
             let name_width = tree_name_width.saturating_sub(indent_width + 2).max(1);
-            let style = if index == cursor {
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
+            let selected = index == cursor;
+            let style = Style::default();
             let rate = event_log.rate_for_prefix(&line.display_path, filter, processes);
             let rate_str = if rate > 0.0 {
                 format!("{}/s", format_bytes_raw(rate as u64))
@@ -223,6 +220,9 @@ pub fn draw(
                     format!("  {:>8}", format_bytes(line.total_bytes)),
                     style.fg(Color::Yellow),
                 )),
+            }
+            if selected {
+                highlight_selected(&mut spans);
             }
             ListItem::new(Line::from(spans))
         })

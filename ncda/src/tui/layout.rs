@@ -1,3 +1,5 @@
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Span;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +52,16 @@ impl TableColumns {
             WidthProfile::Compact => 2 + self.name + self.graph + 20,
             WidthProfile::Minimal => 2 + self.name + 10,
         }
+    }
+}
+
+pub fn highlight_selected(spans: &mut [Span<'_>]) {
+    let style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD);
+    for span in spans {
+        span.style = style;
     }
 }
 
@@ -119,6 +131,21 @@ mod tests {
     fn display_fitting_handles_wide_unicode() {
         let fitted = fit_display("📦données", 7);
         assert_eq!(UnicodeWidthStr::width(fitted.as_str()), 7);
+    }
+
+    #[test]
+    fn selection_overrides_low_contrast_cell_colors() {
+        let mut spans = [
+            Span::styled("name", Style::default().fg(Color::Blue)),
+            Span::styled("metric", Style::default().fg(Color::Red)),
+        ];
+        highlight_selected(&mut spans);
+
+        let expected = Style::default()
+            .fg(Color::Black)
+            .bg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD);
+        assert!(spans.iter().all(|span| span.style == expected));
     }
 
     #[test]
