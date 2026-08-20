@@ -133,7 +133,18 @@ impl EventLog {
         filter: &FilterQuery,
         processes: &ProcessTable,
     ) -> Vec<u64> {
-        self.bucketize(buckets, Instant::now(), |event| {
+        self.sparkline_for_prefix_at(prefix, buckets, filter, processes, Instant::now())
+    }
+
+    pub fn sparkline_for_prefix_at(
+        &self,
+        prefix: &str,
+        buckets: usize,
+        filter: &FilterQuery,
+        processes: &ProcessTable,
+        now: Instant,
+    ) -> Vec<u64> {
+        self.bucketize(buckets, now, |event| {
             path_matches_prefix(&event.path, prefix)
                 && filter.matches_activity(
                     &event.path,
@@ -264,6 +275,32 @@ mod tests {
         assert_eq!(
             log.bucketize(4, origin + Duration::from_millis(2_000), |_| true),
             vec![0, 12, 4, 0]
+        );
+    }
+
+    #[test]
+    fn shared_snapshot_aligns_histories_across_paths() {
+        let mut log = EventLog::new(Duration::from_secs(4));
+        let origin = log.bucket_origin;
+        for (path, bytes) in [("/a", 5), ("/b", 7)] {
+            log.events.push_back(TimestampedEvent {
+                timestamp: origin + Duration::from_millis(100),
+                path: path.to_string(),
+                pid: 7,
+                bytes,
+            });
+        }
+        let filter = FilterQuery::default();
+        let processes = ProcessTable::new();
+        let now = origin + Duration::from_millis(2_000);
+
+        assert_eq!(
+            log.sparkline_for_prefix_at("/a", 4, &filter, &processes, now),
+            vec![0, 5, 0, 0]
+        );
+        assert_eq!(
+            log.sparkline_for_prefix_at("/b", 4, &filter, &processes, now),
+            vec![0, 7, 0, 0]
         );
     }
 

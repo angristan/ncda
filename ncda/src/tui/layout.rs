@@ -53,11 +53,19 @@ impl TableColumns {
     }
 }
 
+pub fn activity_sparkline_width(width: usize) -> usize {
+    if width < 8 {
+        return 0;
+    }
+    let bar_width = (width / 3).clamp(3, 8);
+    width.saturating_sub(bar_width + 1)
+}
+
 pub fn activity_cell(total: u64, maximum: u64, samples: &[u64], width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let spark_width = if width >= 12 { 8.min(width - 4) } else { 0 };
+    let spark_width = activity_sparkline_width(width);
     let bar_width = width.saturating_sub(spark_width + usize::from(spark_width > 0));
     let mut cell = byte_bar(total, maximum, bar_width);
     if spark_width > 0 {
@@ -152,9 +160,18 @@ mod tests {
     }
 
     #[test]
+    fn sparkline_resolution_grows_with_activity_width() {
+        assert_eq!(activity_sparkline_width(7), 0);
+        assert_eq!(activity_sparkline_width(8), 4);
+        assert_eq!(activity_sparkline_width(20), 13);
+        assert_eq!(activity_sparkline_width(30), 21);
+    }
+
+    #[test]
     fn sparklines_scale_and_pad() {
         assert_eq!(sparkline(&[0, 0], 4), "    ");
         assert_eq!(sparkline(&[0, 8, 0, 4], 4), " █ ▄");
         assert_eq!(sparkline(&[1, 2, 4, 8], 4), "▁▂▄█");
+        assert_eq!(activity_cell(5, 10, &[1; 21], 30).chars().count(), 30);
     }
 }
