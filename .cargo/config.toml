@@ -1,2 +1,2 @@
-[target."cfg(all())"]
-runner = "sudo -E"
+# Keep normal Cargo commands unprivileged. The ignored live eBPF integration
+# suite uses its explicit, sanitized sudo wrapper instead of a global runner.

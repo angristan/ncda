@@ -23,6 +23,10 @@ fn main() -> anyhow::Result<()> {
             .as_str(),
         ..Default::default()
     };
+    // Keep the nested Cargo build quiet on success; aya-build forwards all
+    // child stderr as warnings. Compilation errors are still forwarded.
+    std::env::set_var("CARGO_TERM_QUIET", "true");
+
     // Arch's bpf-linker 0.11 is linked against LLVM 22. Keep the eBPF
     // compiler on the same LLVM major; newer LLVM bitcode is not compatible.
     aya_build::build_ebpf([ebpf_package], Toolchain::Custom("nightly-2026-08-04"))

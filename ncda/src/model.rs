@@ -26,11 +26,7 @@ impl NodeStats {
 
     pub fn avg_latency_ns(&self) -> u64 {
         let ops = self.read_ops + self.write_ops;
-        if ops == 0 {
-            0
-        } else {
-            self.total_latency_ns / ops
-        }
+        self.total_latency_ns.checked_div(ops).unwrap_or(0)
     }
 
     pub fn accumulate(&mut self, other: &NodeStats) {
