@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::tui::app::{ViewMode, ViewState};
+use crate::tui::app::{PaneFocus, ViewMode, ViewState};
 use crate::tui::filter::FilterQuery;
 use crate::tui::tree_view::TreeLine;
 
@@ -10,6 +10,7 @@ pub fn handle_key(
     view: &mut ViewState,
     flat_child_count: usize,
     tree_lines: &[TreeLine],
+    process_pids: &[u32],
     should_reset: &mut bool,
 ) -> bool {
     // If help is showing, any key dismisses it
@@ -20,6 +21,9 @@ pub fn handle_key(
     if view.filter_input.is_some() {
         handle_filter_input(key, view);
         return false;
+    }
+    if view.focus == PaneFocus::Processes {
+        return handle_process_key(key, view, process_pids);
     }
 
     match key.code {
@@ -137,6 +141,14 @@ pub fn handle_key(
         // Process panel toggle
         KeyCode::Char('p') => {
             view.show_processes = !view.show_processes;
+            if !view.show_processes {
+                view.focus = PaneFocus::Files;
+            }
+        }
+        KeyCode::Char('P') => {
+            view.show_processes = true;
+            view.focus = PaneFocus::Processes;
+            view.reconcile_process_selection(process_pids);
         }
 
         // Reset counters
@@ -152,6 +164,51 @@ pub fn handle_key(
         _ => {}
     }
 
+    false
+}
+
+fn handle_process_key(key: KeyEvent, view: &mut ViewState, process_pids: &[u32]) -> bool {
+    match key.code {
+        KeyCode::Char('q') => return true,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+        KeyCode::Esc | KeyCode::Char('P') => view.focus = PaneFocus::Files,
+        KeyCode::Char('p') => {
+            view.show_processes = false;
+            view.focus = PaneFocus::Files;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.process_cursor = view.process_cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.process_cursor =
+                (view.process_cursor + 1).min(process_pids.len().saturating_sub(1));
+        }
+        KeyCode::Home | KeyCode::Char('g') => view.process_cursor = 0,
+        KeyCode::End | KeyCode::Char('G') => {
+            view.process_cursor = process_pids.len().saturating_sub(1);
+        }
+        KeyCode::PageUp => view.process_cursor = view.process_cursor.saturating_sub(20),
+        KeyCode::PageDown => {
+            view.process_cursor =
+                (view.process_cursor + 20).min(process_pids.len().saturating_sub(1));
+        }
+        KeyCode::Char('s') => view.process_sort = view.process_sort.next(),
+        KeyCode::Char('S') => view.process_sort_desc = !view.process_sort_desc,
+        KeyCode::Enter => {
+            if let Some(pid) = process_pids.get(view.process_cursor) {
+                view.filter = FilterQuery::parse(&format!("pid:{pid}")).unwrap();
+                view.cursor = 0;
+                view.focus = PaneFocus::Files;
+            }
+        }
+        KeyCode::Char('/') => {
+            view.filter_input = Some(view.filter.raw().to_string());
+            view.filter_error = None;
+        }
+        KeyCode::Char('?') => view.show_help = true,
+        _ => {}
+    }
+    view.selected_process = process_pids.get(view.process_cursor).copied();
     false
 }
 
@@ -213,6 +270,7 @@ mod tests {
             &mut view,
             0,
             &lines,
+            &[],
             &mut reset,
         );
         for character in "pid:42".chars() {
@@ -221,6 +279,7 @@ mod tests {
                 &mut view,
                 0,
                 &lines,
+                &[],
                 &mut reset,
             );
         }
@@ -229,6 +288,7 @@ mod tests {
             &mut view,
             0,
             &lines,
+            &[],
             &mut reset,
         );
         assert_eq!(view.filter.raw(), "pid:42");
@@ -239,6 +299,7 @@ mod tests {
             &mut view,
             0,
             &lines,
+            &[],
             &mut reset,
         );
         assert!(view.filter.is_empty());
@@ -251,5 +312,26 @@ mod tests {
         handle_filter_input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut view);
         assert!(view.filter_input.is_some());
         assert!(view.filter_error.is_some());
+    }
+
+    #[test]
+    fn process_navigation_applies_selected_pid_filter() {
+        let mut view = ViewState::new();
+        view.show_processes = true;
+        view.focus = PaneFocus::Processes;
+        let pids = [10, 20, 30];
+        handle_process_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut view,
+            &pids,
+        );
+        assert_eq!(view.selected_process, Some(20));
+        handle_process_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut view,
+            &pids,
+        );
+        assert_eq!(view.filter.raw(), "pid:20");
+        assert_eq!(view.focus, PaneFocus::Files);
     }
 }

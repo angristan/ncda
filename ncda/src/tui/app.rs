@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::bpf::{BpfEvent, FdPathCache};
 use crate::container::ContainerResolver;
 use crate::model::{FileTree, OpKind, SortBy};
-use crate::process::ProcessTable;
+use crate::process::{ProcessSort, ProcessTable};
 use crate::rate::{EventLog, RateTracker};
 use crate::tui::filter::FilterQuery;
 
@@ -188,6 +188,12 @@ pub enum ViewMode {
     Tree,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneFocus {
+    Files,
+    Processes,
+}
+
 /// TUI view state — not shared, owned by the render loop.
 #[allow(dead_code)]
 pub struct ViewState {
@@ -201,6 +207,11 @@ pub struct ViewState {
     pub sort_by: SortBy,
     pub sort_desc: bool,
     pub show_processes: bool,
+    pub focus: PaneFocus,
+    pub process_cursor: usize,
+    pub selected_process: Option<u32>,
+    pub process_sort: ProcessSort,
+    pub process_sort_desc: bool,
     pub show_help: bool,
     pub filter: FilterQuery,
     pub filter_input: Option<String>,
@@ -224,11 +235,32 @@ impl ViewState {
             sort_by: SortBy::TotalBytes,
             sort_desc: true,
             show_processes: false,
+            focus: PaneFocus::Files,
+            process_cursor: 0,
+            selected_process: None,
+            process_sort: ProcessSort::TotalBytes,
+            process_sort_desc: true,
             show_help: false,
             filter: FilterQuery::default(),
             filter_input: None,
             filter_error: None,
         }
+    }
+
+    pub fn reconcile_process_selection(&mut self, pids: &[u32]) {
+        if pids.is_empty() {
+            self.process_cursor = 0;
+            self.selected_process = None;
+            return;
+        }
+        if let Some(selected) = self.selected_process {
+            if let Some(index) = pids.iter().position(|pid| *pid == selected) {
+                self.process_cursor = index;
+                return;
+            }
+        }
+        self.process_cursor = self.process_cursor.min(pids.len() - 1);
+        self.selected_process = Some(pids[self.process_cursor]);
     }
 
     /// Full path string for the current directory.

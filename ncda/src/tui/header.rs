@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use super::app::{ViewMode, ViewState};
+use super::app::{PaneFocus, ViewMode, ViewState};
 
 pub fn draw(f: &mut Frame, area: Rect, view: &ViewState) {
     let mode_label = match view.mode {
@@ -49,7 +49,20 @@ pub fn draw(f: &mut Frame, area: Rect, view: &ViewState) {
             Span::raw("")
         },
         if view.show_processes {
-            Span::styled("  [P]rocs", Style::default().fg(Color::Magenta))
+            Span::styled(
+                if view.focus == PaneFocus::Processes {
+                    "  [PROCS]"
+                } else {
+                    "  [P]rocs"
+                },
+                Style::default().fg(Color::Magenta).add_modifier(
+                    if view.focus == PaneFocus::Processes {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    },
+                ),
+            )
         } else {
             Span::raw("")
         },

@@ -10,6 +10,43 @@ pub struct ProcessInfo {
     pub stats: NodeStats,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessSort {
+    TotalBytes,
+    ReadBytes,
+    WriteBytes,
+    Operations,
+    Latency,
+    Pid,
+    Name,
+}
+
+impl ProcessSort {
+    pub fn next(self) -> Self {
+        match self {
+            Self::TotalBytes => Self::ReadBytes,
+            Self::ReadBytes => Self::WriteBytes,
+            Self::WriteBytes => Self::Operations,
+            Self::Operations => Self::Latency,
+            Self::Latency => Self::Pid,
+            Self::Pid => Self::Name,
+            Self::Name => Self::TotalBytes,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TotalBytes => "bytes",
+            Self::ReadBytes => "read",
+            Self::WriteBytes => "write",
+            Self::Operations => "ops",
+            Self::Latency => "latency",
+            Self::Pid => "pid",
+            Self::Name => "name",
+        }
+    }
+}
+
 /// Global process table tracking per-process I/O activity.
 pub struct ProcessTable {
     pub processes: HashMap<u32, ProcessInfo>,
@@ -70,12 +107,29 @@ impl ProcessTable {
         }
     }
 
+    pub fn sorted(&self, sort: ProcessSort, descending: bool) -> Vec<&ProcessInfo> {
+        let mut processes: Vec<&ProcessInfo> = self.processes.values().collect();
+        processes.sort_by(|a, b| {
+            let order = match sort {
+                ProcessSort::TotalBytes => a.stats.total_bytes().cmp(&b.stats.total_bytes()),
+                ProcessSort::ReadBytes => a.stats.read_bytes.cmp(&b.stats.read_bytes),
+                ProcessSort::WriteBytes => a.stats.write_bytes.cmp(&b.stats.write_bytes),
+                ProcessSort::Operations => a.stats.total_ops().cmp(&b.stats.total_ops()),
+                ProcessSort::Latency => a.stats.avg_latency_ns().cmp(&b.stats.avg_latency_ns()),
+                ProcessSort::Pid => a.pid.cmp(&b.pid),
+                ProcessSort::Name => a.comm.cmp(&b.comm),
+            };
+            let order = if descending { order.reverse() } else { order };
+            order.then_with(|| a.pid.cmp(&b.pid))
+        });
+        processes
+    }
+
     /// Get top N processes sorted by total bytes.
     pub fn top_by_bytes(&self, n: usize) -> Vec<&ProcessInfo> {
-        let mut procs: Vec<&ProcessInfo> = self.processes.values().collect();
-        procs.sort_by(|a, b| b.stats.total_bytes().cmp(&a.stats.total_bytes()));
-        procs.truncate(n);
-        procs
+        let mut processes = self.sorted(ProcessSort::TotalBytes, true);
+        processes.truncate(n);
+        processes
     }
 
     pub fn reset(&mut self) {
@@ -89,4 +143,46 @@ fn read_comm(pid: u32) -> String {
         .unwrap_or_default()
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_sorts_are_deterministic() {
+        let mut table = ProcessTable::new();
+        table.processes.insert(
+            20,
+            ProcessInfo {
+                pid: 20,
+                comm: "beta".to_string(),
+                container: None,
+                stats: NodeStats {
+                    read_bytes: 10,
+                    ..NodeStats::default()
+                },
+            },
+        );
+        table.processes.insert(
+            10,
+            ProcessInfo {
+                pid: 10,
+                comm: "alpha".to_string(),
+                container: None,
+                stats: NodeStats {
+                    read_bytes: 10,
+                    ..NodeStats::default()
+                },
+            },
+        );
+
+        let pids: Vec<u32> = table
+            .sorted(ProcessSort::TotalBytes, true)
+            .into_iter()
+            .map(|process| process.pid)
+            .collect();
+        assert_eq!(pids, vec![10, 20]);
+        assert_eq!(table.sorted(ProcessSort::Name, false)[0].pid, 10);
+    }
 }

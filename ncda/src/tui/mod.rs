@@ -23,7 +23,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Terminal;
 
-use self::app::{AppState, ViewMode, ViewState};
+use self::app::{AppState, PaneFocus, ViewMode, ViewState};
 
 /// Run the TUI event loop.
 pub fn run(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
@@ -57,6 +57,7 @@ pub fn run(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
                         | crossterm::event::KeyCode::Right
                         | crossterm::event::KeyCode::Char('l')
                 ) && view.mode == ViewMode::Flat
+                    && view.focus == PaneFocus::Files
                     && view.filter_input.is_none()
                 {
                     let state = state.lock().unwrap();
@@ -102,9 +103,32 @@ pub fn run(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
                     )
                 };
 
+                let process_pids = {
+                    let state = state.lock().unwrap();
+                    visible_processes(&state, &view)
+                        .into_iter()
+                        .map(|process| process.pid)
+                        .collect::<Vec<_>>()
+                };
+                view.reconcile_process_selection(&process_pids);
+
                 let mut should_reset = false;
-                let quit =
-                    input::handle_key(key, &mut view, flat_count, &tree_lines, &mut should_reset);
+                let quit = input::handle_key(
+                    key,
+                    &mut view,
+                    flat_count,
+                    &tree_lines,
+                    &process_pids,
+                    &mut should_reset,
+                );
+                let updated_process_pids = {
+                    let state = state.lock().unwrap();
+                    visible_processes(&state, &view)
+                        .into_iter()
+                        .map(|process| process.pid)
+                        .collect::<Vec<_>>()
+                };
+                view.reconcile_process_selection(&updated_process_pids);
 
                 if should_reset {
                     let mut state = state.lock().unwrap();
@@ -249,6 +273,18 @@ fn compute_body_areas(area: Rect, show_processes: bool) -> BodyAreas {
     }
 }
 
+fn visible_processes<'a>(
+    state: &'a AppState,
+    view: &ViewState,
+) -> Vec<&'a crate::process::ProcessInfo> {
+    state
+        .process_table
+        .sorted(view.process_sort, view.process_sort_desc)
+        .into_iter()
+        .filter(|process| view.filter.matches_process(process))
+        .collect()
+}
+
 fn draw_process_panel(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -256,32 +292,58 @@ fn draw_process_panel(
     view: &ViewState,
     borders: Borders,
 ) {
-    let block = Block::default().title(" Processes ").borders(borders);
+    let sort_arrow = if view.process_sort_desc { "▼" } else { "▲" };
+    let block = Block::default()
+        .title(format!(
+            " Processes {}{} ",
+            view.process_sort.label(),
+            sort_arrow
+        ))
+        .borders(borders);
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let top = state.process_table.top_by_bytes(usize::MAX);
+    let top = visible_processes(state, view);
     let comm_width = process_name_width(inner.width);
+    let visible_height = inner.height as usize;
+    let start = view
+        .process_cursor
+        .saturating_add(1)
+        .saturating_sub(visible_height);
     let items: Vec<Line> = top
         .into_iter()
-        .filter(|process| view.filter.matches_process(process))
-        .take(inner.height as usize)
-        .map(|p| {
+        .skip(start)
+        .take(visible_height)
+        .enumerate()
+        .map(|(offset, p)| {
+            let index = start + offset;
+            let selected = view.focus == PaneFocus::Processes && index == view.process_cursor;
+            let style = if selected {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let identity = match &p.container {
+                Some(container) => format!("{}@{container}", p.comm),
+                None => p.comm.clone(),
+            };
             Line::from(vec![
-                Span::styled(format!("{:>6} ", p.pid), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{:>6} ", p.pid), style.fg(Color::Yellow)),
                 Span::styled(
-                    format!("{} ", layout::fit_display(&p.comm, comm_width)),
-                    Style::default().fg(Color::White),
+                    format!("{} ", layout::fit_display(&identity, comm_width)),
+                    style.fg(Color::White),
                 ),
                 Span::styled(
                     format!("R:{:>6}", footer::format_bytes(p.stats.read_bytes)),
-                    Style::default().fg(Color::Cyan),
+                    style.fg(Color::Cyan),
                 ),
-                Span::raw(" "),
+                Span::styled(" ", style),
                 Span::styled(
                     format!("W:{:>6}", footer::format_bytes(p.stats.write_bytes)),
-                    Style::default().fg(Color::Red),
+                    style.fg(Color::Red),
                 ),
             ])
         })
@@ -294,7 +356,7 @@ fn draw_process_panel(
 fn draw_help_overlay(f: &mut ratatui::Frame) {
     let area = f.area();
     let width = 50u16.min(area.width.saturating_sub(4));
-    let height = 20u16.min(area.height.saturating_sub(4));
+    let height = 22u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let popup_area = Rect::new(x, y, width, height);
@@ -317,6 +379,8 @@ fn draw_help_overlay(f: &mut ratatui::Frame) {
         Line::from(" s          Cycle sort mode"),
         Line::from(" S          Reverse sort direction"),
         Line::from(" p          Toggle process panel"),
+        Line::from(" P          Focus process panel"),
+        Line::from(" Enter      Filter selected process"),
         Line::from(" /          Filter activity"),
         Line::from(" Esc        Clear active filter"),
         Line::from(" r          Reset all counters"),
