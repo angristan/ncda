@@ -57,8 +57,8 @@ impl TableColumns {
 
 pub fn highlight_selected(spans: &mut [Span<'_>]) {
     let style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::LightCyan)
+        .fg(Color::White)
+        .bg(Color::Rgb(45, 55, 72))
         .add_modifier(Modifier::BOLD);
     for span in spans {
         span.style = style;
@@ -142,8 +142,8 @@ mod tests {
         highlight_selected(&mut spans);
 
         let expected = Style::default()
-            .fg(Color::Black)
-            .bg(Color::LightCyan)
+            .fg(Color::White)
+            .bg(Color::Rgb(45, 55, 72))
             .add_modifier(Modifier::BOLD);
         assert!(spans.iter().all(|span| span.style == expected));
     }
