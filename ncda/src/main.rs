@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Vec<BpfEvent>>(512);
     let reader_drops = Arc::new(ReaderDropCounters::default());
     let (reader_shutdown_tx, reader_shutdown_rx) = watch::channel(false);
-    let reader_handle = tokio::spawn(bpf::reader_loop_polling(
+    let reader_handle = tokio::spawn(bpf::reader_loop(
         ring_buf,
         tx,
         reader_shutdown_rx,

@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use aya::maps::{MapData, PerCpuArray, RingBuf};
@@ -278,86 +277,67 @@ fn require_field_at(
     anyhow::bail!("syscalls/{tracepoint} has no syscall argument at offset {offset}, size {size}")
 }
 
-/// Read events from the ring buffer and send parsed events over a channel.
-/// This runs as a tokio task using epoll-based async notification.
-#[allow(dead_code)]
+/// Read ring-buffer events using epoll readiness instead of periodic polling.
+/// The caller detaches all producers before requesting shutdown, allowing one
+/// final nonblocking drain to consume every record already in the ring.
 pub async fn reader_loop(
     ring_buf: RingBuf<MapData>,
-    tx: mpsc::Sender<Vec<BpfEvent>>,
-) -> Result<()> {
-    // Wrap in AsyncFd for epoll-based notification.
-    // RingBuf implements AsRawFd so AsyncFd can poll it.
-    let mut async_fd = AsyncFd::new(ring_buf)?;
-
-    loop {
-        // Wait for data to be available
-        let mut guard = async_fd.readable_mut().await?;
-        let rb = guard.get_inner_mut();
-
-        let mut batch = Vec::with_capacity(256);
-
-        // Drain all available events
-        while let Some(item) = rb.next() {
-            let data: &[u8] = &item;
-            if let Some(event) = parse_event(data) {
-                batch.push(event);
-            }
-        }
-
-        guard.clear_ready();
-
-        if !batch.is_empty() {
-            if tx.send(batch).await.is_err() {
-                break; // receiver dropped
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Polling-based reader for environments where AsyncFd doesn't work.
-pub async fn reader_loop_polling(
-    mut ring_buf: RingBuf<MapData>,
     tx: mpsc::Sender<Vec<BpfEvent>>,
     mut shutdown: watch::Receiver<bool>,
     drops: Arc<ReaderDropCounters>,
 ) -> Result<()> {
+    let mut async_fd = AsyncFd::new(ring_buf)?;
+
     loop {
-        let mut batch = Vec::with_capacity(256);
-
-        while let Some(item) = ring_buf.next() {
-            let data: &[u8] = &item;
-            if let Some(event) = parse_event(data) {
-                batch.push(event);
-            } else {
-                drops.record_parse_drop();
-            }
-        }
-
-        if !batch.is_empty() {
-            let batch_len = batch.len();
-            if tx.send(batch).await.is_err() {
-                drops.record_queue_drops(batch_len);
-                return Ok(());
-            }
-        }
-
-        // The caller detaches all producers before setting shutdown, so this
-        // drain observes every record that reached the ring buffer.
-        if *shutdown.borrow() {
-            return Ok(());
-        }
-
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
             result = shutdown.changed() => {
-                if result.is_err() {
+                let batch = drain_ring(async_fd.get_mut(), &drops);
+                send_batch(&tx, batch, &drops).await;
+                if result.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            ready = async_fd.readable_mut() => {
+                let mut guard = ready?;
+                let batch = drain_ring(guard.get_inner_mut(), &drops);
+                guard.clear_ready();
+                drop(guard);
+                if !send_batch(&tx, batch, &drops).await {
                     return Ok(());
                 }
             }
         }
     }
+}
+
+fn drain_ring(ring_buf: &mut RingBuf<MapData>, drops: &ReaderDropCounters) -> Vec<BpfEvent> {
+    let mut batch = Vec::with_capacity(256);
+    while let Some(item) = ring_buf.next() {
+        let data: &[u8] = &item;
+        if let Some(event) = parse_event(data) {
+            batch.push(event);
+        } else {
+            drops.record_parse_drop();
+        }
+    }
+    batch
+}
+
+async fn send_batch(
+    tx: &mpsc::Sender<Vec<BpfEvent>>,
+    batch: Vec<BpfEvent>,
+    drops: &ReaderDropCounters,
+) -> bool {
+    if batch.is_empty() {
+        return true;
+    }
+
+    let batch_len = batch.len();
+    if tx.send(batch).await.is_err() {
+        drops.record_queue_drops(batch_len);
+        return false;
+    }
+    true
 }
 
 /// Parse raw bytes from the ring buffer into a BpfEvent.
