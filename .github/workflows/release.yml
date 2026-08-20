@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+
+      - name: Install userspace Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools zstd
+          rustup toolchain install nightly-2026-08-04 --profile minimal --component rust-src
+          INSTALL_ROOT="$HOME/.local/bin" scripts/install-bpf-linker.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build static binaries
+        run: cargo build --release --locked --bins --target '${{ matrix.target }}'
+
+      - name: Package deterministic archive
+        shell: bash
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          package="ncda-$version-${{ matrix.target }}"
+          mkdir -p "dist/$package"
+          install -m 0755 'target/${{ matrix.target }}/release/ncda' "dist/$package/ncda"
+          install -m 0755 'target/${{ matrix.target }}/release/ncda-bench' "dist/$package/ncda-bench"
+          install -m 0644 README.md "dist/$package/README.md"
+          strip "dist/$package/ncda" "dist/$package/ncda-bench"
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -C dist -cf - "$package" | gzip -n > "dist/$package.tar.gz"
+          (cd dist && sha256sum "$package.tar.gz" > "$package.tar.gz.sha256")
+          rm -rf -- "dist/$package"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@484a0b528fb4d7bd804637ccb632e47a0e638317
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Attest release archives
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Publish release
+        uses: softprops/action-gh-release@e5ee6bc58a36b838b92fc1217f2e4b414b5abcc8
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

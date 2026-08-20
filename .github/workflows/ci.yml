@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: ${{ matrix.arch }} quality and live eBPF
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+
+      - name: Install userspace Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: clippy,rustfmt
+
+      - name: Install eBPF Rust and linker
+        shell: bash
+        run: |
+          rustup toolchain install nightly-2026-08-04 --profile minimal --component rust-src
+          INSTALL_ROOT="$HOME/.local/bin" scripts/install-bpf-linker.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run unprivileged tests
+        run: cargo test --locked
+
+      - name: Build release binaries
+        run: cargo build --release --locked --bins
+
+      # GitHub-hosted runners are disposable VMs. This never runs on
+      # pull_request_target and receives no repository secrets.
+      - name: Run live eBPF integration suite
+        run: scripts/test-ebpf.sh
