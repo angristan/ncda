@@ -6,13 +6,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use ratatui::Frame;
 
-use crate::model::{FileTree, SortBy, TreeNode};
+use crate::model::{FileTree, NodeStats, SortBy, TreeNode};
+use crate::process::ProcessTable;
+use crate::tui::filter::{filtered_stats, join_path, FilterQuery};
 use crate::tui::footer::{format_bytes, format_count, format_latency};
 
-// Everything except the flexible tree-name column: graph and metrics.
 const FIXED_COLUMNS_WIDTH: usize = 44;
 
-/// A flattened tree line for rendering.
 pub struct TreeLine {
     pub depth: usize,
     pub path: Vec<String>,
@@ -26,79 +26,110 @@ pub struct TreeLine {
     pub total_bytes: u64,
 }
 
-/// Flatten the tree into a list of visible lines based on which nodes are expanded.
 pub fn flatten(
     tree: &FileTree,
     expanded: &HashSet<Vec<String>>,
     sort_by: SortBy,
     sort_desc: bool,
+    filter: &FilterQuery,
+    processes: &ProcessTable,
 ) -> Vec<TreeLine> {
     let mut lines = Vec::new();
     let mut path = Vec::new();
     flatten_recurse(
-        &tree.root, &mut path, 0, expanded, sort_by, sort_desc, &mut lines,
+        &tree.root, &mut path, "/", 0, expanded, sort_by, sort_desc, filter, processes, &mut lines,
     );
     lines
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flatten_recurse(
     node: &TreeNode,
     path: &mut Vec<String>,
+    display_path: &str,
     depth: usize,
     expanded: &HashSet<Vec<String>>,
     sort_by: SortBy,
     sort_desc: bool,
+    filter: &FilterQuery,
+    processes: &ProcessTable,
     lines: &mut Vec<TreeLine>,
 ) {
-    let children = node.sorted_children(sort_by, sort_desc);
+    let mut children: Vec<(&TreeNode, String, NodeStats)> = node
+        .children
+        .values()
+        .filter_map(|child| {
+            let child_path = join_path(display_path, &child.name);
+            let stats = filtered_stats(child, &child_path, filter, processes)?;
+            Some((child, child_path, stats))
+        })
+        .collect();
+    children.sort_by(|(a, _, a_stats), (b, _, b_stats)| {
+        let order = match sort_by {
+            SortBy::TotalBytes => a_stats.total_bytes().cmp(&b_stats.total_bytes()),
+            SortBy::ReadBytes => a_stats.read_bytes.cmp(&b_stats.read_bytes),
+            SortBy::WriteBytes => a_stats.write_bytes.cmp(&b_stats.write_bytes),
+            SortBy::Frequency => a_stats.total_ops().cmp(&b_stats.total_ops()),
+            SortBy::Latency => a_stats.avg_latency_ns().cmp(&b_stats.avg_latency_ns()),
+            SortBy::Name => a.name.cmp(&b.name),
+        };
+        let order = if sort_desc { order.reverse() } else { order };
+        order.then_with(|| a.name.cmp(&b.name))
+    });
 
-    for child in children {
+    for (child, child_display_path, stats) in children {
         path.push(child.name.clone());
-        let is_exp = expanded.contains(path);
-
+        let is_expanded = expanded.contains(path);
         lines.push(TreeLine {
             depth,
             path: path.clone(),
             name: child.name.clone(),
             is_dir: child.is_dir,
-            is_expanded: is_exp,
-            read_bytes: child.agg_stats.read_bytes,
-            write_bytes: child.agg_stats.write_bytes,
-            total_ops: child.agg_stats.total_ops(),
-            avg_latency_ns: child.agg_stats.avg_latency_ns(),
-            total_bytes: child.agg_stats.total_bytes(),
+            is_expanded,
+            read_bytes: stats.read_bytes,
+            write_bytes: stats.write_bytes,
+            total_ops: stats.total_ops(),
+            avg_latency_ns: stats.avg_latency_ns(),
+            total_bytes: stats.total_bytes(),
         });
 
-        if child.is_dir && is_exp {
-            flatten_recurse(child, path, depth + 1, expanded, sort_by, sort_desc, lines);
+        if child.is_dir && is_expanded {
+            flatten_recurse(
+                child,
+                path,
+                &child_display_path,
+                depth + 1,
+                expanded,
+                sort_by,
+                sort_desc,
+                filter,
+                processes,
+                lines,
+            );
         }
-
         path.pop();
     }
 }
 
-/// Render the tree view.
 pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize) {
     if lines.is_empty() {
-        let empty = List::new(vec![ListItem::new("  (no file activity recorded)")])
+        let empty = List::new(vec![ListItem::new("  (no activity matches)")])
             .block(Block::default().borders(Borders::NONE));
         f.render_widget(empty, area);
         return;
     }
 
     let name_column_width = name_column_width(area.width);
-
     let max_bytes = lines
         .iter()
-        .map(|l| l.total_bytes)
+        .map(|line| line.total_bytes)
         .max()
         .unwrap_or(1)
         .max(1);
-
     let items: Vec<ListItem> = lines
         .iter()
         .enumerate()
-        .map(|(i, line)| {
+        .map(|(index, line)| {
             let indent_width = (line.depth * 2).min(name_column_width.saturating_sub(3));
             let indent = " ".repeat(indent_width);
             let icon = if line.is_dir {
@@ -110,31 +141,25 @@ pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize) {
             } else {
                 "  "
             };
-
             let name = if line.is_dir {
                 format!("{}/", line.name)
             } else {
                 line.name.clone()
             };
-
-            // Bar graph
             let bar_width = 8;
             let fraction = line.total_bytes as f64 / max_bytes as f64;
             let filled = (fraction * bar_width as f64) as usize;
             let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
-
-            let is_selected = i == cursor;
-            let style = if is_selected {
+            let style = if index == cursor {
                 Style::default()
                     .bg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-
             let max_name_width = name_column_width.saturating_sub(indent_width + 2).max(1);
 
-            let spans = Line::from(vec![
+            ListItem::new(Line::from(vec![
                 Span::styled(indent, style),
                 Span::styled(icon, style),
                 Span::styled(
@@ -171,20 +196,16 @@ pub fn draw(f: &mut Frame, area: Rect, lines: &[TreeLine], cursor: usize) {
                 } else {
                     Span::styled(" ".repeat(8), style)
                 },
-            ]);
-
-            ListItem::new(spans)
+            ]))
         })
         .collect();
 
     let mut state = ListState::default();
-    state.select(Some(cursor));
-
+    state.select(Some(cursor.min(lines.len().saturating_sub(1))));
     let list = List::new(items).block(Block::default().borders(Borders::NONE));
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// Draw column headers for tree view.
 pub fn draw_columns(f: &mut Frame, area: Rect) {
     let name_column_width = name_column_width(area.width);
     let line = Line::from(vec![
@@ -225,6 +246,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::OpKind;
 
     #[test]
     fn flexible_name_column_fills_wide_areas() {
@@ -238,5 +260,25 @@ mod tests {
         let column_width = name_column_width(80);
         let indent_width = (100 * 2).min(column_width.saturating_sub(3));
         assert!(column_width.saturating_sub(indent_width + 2) >= 1);
+    }
+
+    #[test]
+    fn filtered_flatten_keeps_matching_ancestors() {
+        let mut tree = FileTree::new();
+        tree.record("/var/log/a", 1, OpKind::Read, 5, 1);
+        tree.record("/home/b", 2, OpKind::Read, 7, 1);
+        let mut processes = ProcessTable::new();
+        processes.record(1, OpKind::Read, 5, 1);
+        processes.record(2, OpKind::Read, 7, 1);
+        let lines = flatten(
+            &tree,
+            &HashSet::new(),
+            SortBy::Name,
+            false,
+            &FilterQuery::parse("path:log").unwrap(),
+            &processes,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].name, "var");
     }
 }

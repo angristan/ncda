@@ -1,4 +1,5 @@
 pub mod app;
+pub mod filter;
 pub mod flat_view;
 pub mod footer;
 pub mod header;
@@ -55,15 +56,21 @@ pub fn run(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
                         | crossterm::event::KeyCode::Right
                         | crossterm::event::KeyCode::Char('l')
                 ) && view.mode == ViewMode::Flat
+                    && view.filter_input.is_none()
                 {
                     let state = state.lock().unwrap();
-                    if let Some(node) = state.tree.get_node(&view.cwd) {
-                        let children = node.sorted_children(view.sort_by, view.sort_desc);
-                        if let Some(child) = children.get(view.cursor) {
-                            if child.is_dir {
-                                view.cwd.push(child.name.clone());
-                                view.cursor = 0;
-                            }
+                    let rows = flat_view::visible_rows(
+                        &state.tree,
+                        &view.cwd,
+                        view.sort_by,
+                        view.sort_desc,
+                        &view.filter,
+                        &state.process_table,
+                    );
+                    if let Some(row) = rows.get(view.cursor) {
+                        if row.is_dir {
+                            view.cwd.push(row.name.clone());
+                            view.cursor = 0;
                         }
                     }
                     continue;
@@ -71,12 +78,27 @@ pub fn run(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
 
                 let flat_count = {
                     let state = state.lock().unwrap();
-                    flat_view::child_count(&state.tree, &view.cwd)
+                    flat_view::visible_rows(
+                        &state.tree,
+                        &view.cwd,
+                        view.sort_by,
+                        view.sort_desc,
+                        &view.filter,
+                        &state.process_table,
+                    )
+                    .len()
                 };
 
                 let tree_lines = {
                     let state = state.lock().unwrap();
-                    tree_view::flatten(&state.tree, &view.expanded, view.sort_by, view.sort_desc)
+                    tree_view::flatten(
+                        &state.tree,
+                        &view.expanded,
+                        view.sort_by,
+                        view.sort_desc,
+                        &view.filter,
+                        &state.process_table,
+                    )
                 };
 
                 let mut should_reset = false;
@@ -134,7 +156,7 @@ fn draw(f: &mut ratatui::Frame, state: &AppState, view: &ViewState) {
             .constraints([Constraint::Length(1), Constraint::Min(0)])
             .split(body_columns[0]);
 
-        draw_process_panel(f, body_columns[1], state);
+        draw_process_panel(f, body_columns[1], state, view);
         (main_rows[0], main_rows[1])
     } else {
         (chunks[1], chunks[2])
@@ -143,14 +165,25 @@ fn draw(f: &mut ratatui::Frame, state: &AppState, view: &ViewState) {
     match view.mode {
         ViewMode::Flat => {
             flat_view::draw_columns(f, columns_area);
-            flat_view::draw(f, main_area, &state.tree, view, |prefix| {
-                state.event_log.rate_for_prefix(prefix)
-            });
+            flat_view::draw(
+                f,
+                main_area,
+                &state.tree,
+                &state.process_table,
+                view,
+                |prefix| state.event_log.rate_for_prefix(prefix),
+            );
         }
         ViewMode::Tree => {
             tree_view::draw_columns(f, columns_area);
-            let lines =
-                tree_view::flatten(&state.tree, &view.expanded, view.sort_by, view.sort_desc);
+            let lines = tree_view::flatten(
+                &state.tree,
+                &view.expanded,
+                view.sort_by,
+                view.sort_desc,
+                &view.filter,
+                &state.process_table,
+            );
             tree_view::draw(f, main_area, &lines, view.cursor);
         }
     }
@@ -171,16 +204,18 @@ fn draw(f: &mut ratatui::Frame, state: &AppState, view: &ViewState) {
     }
 }
 
-fn draw_process_panel(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+fn draw_process_panel(f: &mut ratatui::Frame, area: Rect, state: &AppState, view: &ViewState) {
     let block = Block::default().title(" Processes ").borders(Borders::LEFT);
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let top = state.process_table.top_by_bytes(inner.height as usize);
+    let top = state.process_table.top_by_bytes(usize::MAX);
     let comm_width = process_name_width(inner.width);
     let items: Vec<Line> = top
-        .iter()
+        .into_iter()
+        .filter(|process| view.filter.matches_process(process))
+        .take(inner.height as usize)
         .map(|p| {
             Line::from(vec![
                 Span::styled(format!("{:>6} ", p.pid), Style::default().fg(Color::Yellow)),
@@ -212,7 +247,7 @@ fn draw_process_panel(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
 fn draw_help_overlay(f: &mut ratatui::Frame) {
     let area = f.area();
     let width = 50u16.min(area.width.saturating_sub(4));
-    let height = 18u16.min(area.height.saturating_sub(4));
+    let height = 20u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let popup_area = Rect::new(x, y, width, height);
@@ -235,6 +270,8 @@ fn draw_help_overlay(f: &mut ratatui::Frame) {
         Line::from(" s          Cycle sort mode"),
         Line::from(" S          Reverse sort direction"),
         Line::from(" p          Toggle process panel"),
+        Line::from(" /          Filter activity"),
+        Line::from(" Esc        Clear active filter"),
         Line::from(" r          Reset all counters"),
         Line::from(" g/Home     Jump to top"),
         Line::from(" G/End      Jump to bottom"),

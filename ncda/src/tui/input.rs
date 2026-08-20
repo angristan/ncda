@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::tui::app::{ViewMode, ViewState};
+use crate::tui::filter::FilterQuery;
 use crate::tui::tree_view::TreeLine;
 
 /// Handle a key event, returning true if the app should quit.
@@ -14,6 +15,10 @@ pub fn handle_key(
     // If help is showing, any key dismisses it
     if view.show_help {
         view.show_help = false;
+        return false;
+    }
+    if view.filter_input.is_some() {
+        handle_filter_input(key, view);
         return false;
     }
 
@@ -118,6 +123,17 @@ pub fn handle_key(
             view.sort_desc = !view.sort_desc;
         }
 
+        // Activity filter editor and clear.
+        KeyCode::Char('/') => {
+            view.filter_input = Some(view.filter.raw().to_string());
+            view.filter_error = None;
+        }
+        KeyCode::Esc => {
+            view.filter = FilterQuery::default();
+            view.filter_error = None;
+            view.cursor = 0;
+        }
+
         // Process panel toggle
         KeyCode::Char('p') => {
             view.show_processes = !view.show_processes;
@@ -137,4 +153,103 @@ pub fn handle_key(
     }
 
     false
+}
+
+fn handle_filter_input(key: KeyEvent, view: &mut ViewState) {
+    match key.code {
+        KeyCode::Esc => {
+            view.filter_input = None;
+            view.filter_error = None;
+        }
+        KeyCode::Enter => {
+            let input = view.filter_input.as_deref().unwrap_or_default();
+            match FilterQuery::parse(input) {
+                Ok(filter) => {
+                    view.filter = filter;
+                    view.filter_input = None;
+                    view.filter_error = None;
+                    view.cursor = 0;
+                }
+                Err(error) => view.filter_error = Some(error),
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(input) = &mut view.filter_input {
+                input.pop();
+            }
+            view.filter_error = None;
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(input) = &mut view.filter_input {
+                input.clear();
+            }
+            view.filter_error = None;
+        }
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            if let Some(input) = &mut view.filter_input {
+                input.push(character);
+            }
+            view.filter_error = None;
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_editor_applies_and_clears_queries() {
+        let mut view = ViewState::new();
+        let lines = Vec::new();
+        let mut reset = false;
+        handle_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut view,
+            0,
+            &lines,
+            &mut reset,
+        );
+        for character in "pid:42".chars() {
+            handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &mut view,
+                0,
+                &lines,
+                &mut reset,
+            );
+        }
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut view,
+            0,
+            &lines,
+            &mut reset,
+        );
+        assert_eq!(view.filter.raw(), "pid:42");
+        assert!(view.filter_input.is_none());
+
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut view,
+            0,
+            &lines,
+            &mut reset,
+        );
+        assert!(view.filter.is_empty());
+    }
+
+    #[test]
+    fn invalid_filter_stays_in_editor() {
+        let mut view = ViewState::new();
+        view.filter_input = Some("pid:nope".to_string());
+        handle_filter_input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut view);
+        assert!(view.filter_input.is_some());
+        assert!(view.filter_error.is_some());
+    }
 }

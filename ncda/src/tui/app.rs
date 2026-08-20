@@ -6,6 +6,7 @@ use crate::container::ContainerResolver;
 use crate::model::{FileTree, OpKind, SortBy};
 use crate::process::ProcessTable;
 use crate::rate::{EventLog, RateTracker};
+use crate::tui::filter::FilterQuery;
 
 /// Shared state updated by the aggregator task, read by the TUI.
 pub struct AppState {
@@ -71,7 +72,7 @@ impl AppState {
                         continue;
                     }
                     self.tree.record(&resolved, pid, OpKind::Open, 0, 0);
-                    self.process_table.record(pid, OpKind::Open, 0, 0);
+                    self.record_process(pid, OpKind::Open, 0, 0);
                 }
                 BpfEvent::Read {
                     pid,
@@ -87,8 +88,7 @@ impl AppState {
                         }
                         self.tree
                             .record(&path, pid, OpKind::Read, bytes, latency_ns);
-                        self.process_table
-                            .record(pid, OpKind::Read, bytes, latency_ns);
+                        self.record_process(pid, OpKind::Read, bytes, latency_ns);
                         self.global_rate.record(bytes);
                         self.event_log.record(path, bytes);
                     }
@@ -107,8 +107,7 @@ impl AppState {
                         }
                         self.tree
                             .record(&path, pid, OpKind::Write, bytes, latency_ns);
-                        self.process_table
-                            .record(pid, OpKind::Write, bytes, latency_ns);
+                        self.record_process(pid, OpKind::Write, bytes, latency_ns);
                         self.global_rate.record(bytes);
                         self.event_log.record(path, bytes);
                     }
@@ -123,7 +122,7 @@ impl AppState {
                         let path = path.to_string();
                         if !self.is_excluded(&path) {
                             self.tree.record(&path, pid, OpKind::Close, 0, 0);
-                            self.process_table.record(pid, OpKind::Close, 0, 0);
+                            self.record_process(pid, OpKind::Close, 0, 0);
                         }
                     }
                     self.fd_cache.on_close(pid, fd);
@@ -141,6 +140,12 @@ impl AppState {
                 }
             }
         }
+    }
+
+    fn record_process(&mut self, pid: u32, op: OpKind, bytes: u64, latency_ns: u64) {
+        let container = self.containers.resolve(pid).map(str::to_string);
+        self.process_table
+            .record_with_context(pid, container.as_deref(), op, bytes, latency_ns);
     }
 
     fn resolve_io_path(&mut self, pid: u32, fd: u32) -> Option<String> {
@@ -197,6 +202,9 @@ pub struct ViewState {
     pub sort_desc: bool,
     pub show_processes: bool,
     pub show_help: bool,
+    pub filter: FilterQuery,
+    pub filter_input: Option<String>,
+    pub filter_error: Option<String>,
 }
 
 impl Default for ViewState {
@@ -217,6 +225,9 @@ impl ViewState {
             sort_desc: true,
             show_processes: false,
             show_help: false,
+            filter: FilterQuery::default(),
+            filter_input: None,
+            filter_error: None,
         }
     }
 

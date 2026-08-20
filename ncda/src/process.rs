@@ -6,6 +6,7 @@ use crate::model::{NodeStats, OpKind};
 pub struct ProcessInfo {
     pub pid: u32,
     pub comm: String,
+    pub container: Option<String>,
     pub stats: NodeStats,
 }
 
@@ -28,14 +29,29 @@ impl ProcessTable {
     }
 
     pub fn record(&mut self, pid: u32, op: OpKind, bytes: u64, latency_ns: u64) {
+        self.record_with_context(pid, None, op, bytes, latency_ns);
+    }
+
+    pub fn record_with_context(
+        &mut self,
+        pid: u32,
+        container: Option<&str>,
+        op: OpKind,
+        bytes: u64,
+        latency_ns: u64,
+    ) {
         let info = self.processes.entry(pid).or_insert_with(|| {
             let comm = read_comm(pid);
             ProcessInfo {
                 pid,
                 comm,
+                container: container.map(str::to_string),
                 stats: NodeStats::default(),
             }
         });
+        if info.container.is_none() {
+            info.container = container.map(str::to_string);
+        }
         match op {
             OpKind::Open => info.stats.open_ops += 1,
             OpKind::Read => {

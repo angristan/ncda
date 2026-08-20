@@ -33,6 +33,21 @@ pub fn draw(f: &mut Frame, area: Rect, view: &ViewState) {
             format!("{}{sort_arrow}", view.sort_by.label()),
             Style::default().fg(Color::Green),
         ),
+        if let Some(input) = &view.filter_input {
+            Span::styled(format!("  /{input}█"), Style::default().fg(Color::Cyan))
+        } else if !view.filter.is_empty() {
+            Span::styled(
+                format!("  Filter:{}", view.filter.raw()),
+                Style::default().fg(Color::Cyan),
+            )
+        } else {
+            Span::raw("")
+        },
+        if let Some(error) = &view.filter_error {
+            Span::styled(format!("  {error}"), Style::default().fg(Color::Red))
+        } else {
+            Span::raw("")
+        },
         if view.show_processes {
             Span::styled("  [P]rocs", Style::default().fg(Color::Magenta))
         } else {
