@@ -12,7 +12,8 @@ use crate::rate::EventLog;
 use crate::tui::filter::{filtered_stats, join_path, FilterQuery};
 use crate::tui::footer::{format_bytes, format_bytes_raw, format_count, format_latency};
 use crate::tui::layout::{
-    activity_cell, fit_display, highlight_selected, TableColumns, WidthProfile,
+    activity_cell, fit_display, highlight_inactive_selected, highlight_selected, TableColumns,
+    WidthProfile,
 };
 
 pub struct TreeLine {
@@ -123,10 +124,28 @@ pub fn draw(
     filter: &FilterQuery,
     processes: &ProcessTable,
 ) {
+    draw_with_focus(f, area, lines, cursor, true, event_log, filter, processes);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn draw_with_focus(
+    f: &mut Frame,
+    area: Rect,
+    lines: &[TreeLine],
+    cursor: usize,
+    files_focused: bool,
+    event_log: &EventLog,
+    filter: &FilterQuery,
+    processes: &ProcessTable,
+) {
     if lines.is_empty() {
+        let message = if filter.is_empty() {
+            "  (no file activity recorded)"
+        } else {
+            "  (no activity matches the filter)"
+        };
         f.render_widget(
-            List::new(vec![ListItem::new("  (no activity matches)")])
-                .block(Block::default().borders(Borders::NONE)),
+            List::new(vec![ListItem::new(message)]).block(Block::default().borders(Borders::NONE)),
             area,
         );
         return;
@@ -222,7 +241,11 @@ pub fn draw(
                 )),
             }
             if selected {
-                highlight_selected(&mut spans);
+                if files_focused {
+                    highlight_selected(&mut spans);
+                } else {
+                    highlight_inactive_selected(&mut spans);
+                }
             }
             ListItem::new(Line::from(spans))
         })
@@ -284,6 +307,11 @@ pub fn draw_columns(f: &mut Frame, area: Rect) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
     use super::*;
     use crate::model::OpKind;
 
@@ -305,5 +333,30 @@ mod tests {
         );
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].name, "var");
+    }
+
+    #[test]
+    fn empty_unfiltered_tree_reports_no_recorded_activity() {
+        let backend = TestBackend::new(44, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let event_log = EventLog::new(Duration::from_secs(5));
+        let processes = ProcessTable::new();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    frame.area(),
+                    &[],
+                    0,
+                    &event_log,
+                    &FilterQuery::default(),
+                    &processes,
+                )
+            })
+            .unwrap();
+        let rendered = (0..44)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(rendered.contains("no file activity recorded"));
     }
 }

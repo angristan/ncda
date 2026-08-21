@@ -7,11 +7,12 @@ use ratatui::Frame;
 use crate::model::{FileTree, NodeStats, SortBy};
 use crate::process::ProcessTable;
 use crate::rate::EventLog;
-use crate::tui::app::ViewState;
+use crate::tui::app::{PaneFocus, ViewState};
 use crate::tui::filter::{filtered_stats, join_path, FilterQuery};
 use crate::tui::footer::{format_bytes, format_bytes_raw, format_count, format_latency};
 use crate::tui::layout::{
-    activity_cell, fit_display, highlight_selected, TableColumns, WidthProfile,
+    activity_cell, fit_display, highlight_inactive_selected, highlight_selected, TableColumns,
+    WidthProfile,
 };
 
 #[derive(Debug, Clone)]
@@ -84,10 +85,12 @@ pub fn draw(
         processes,
     );
     if rows.is_empty() {
-        let message = if view.filter.is_empty() {
+        let message = if !view.filter.is_empty() {
+            "  (no activity matches the filter)"
+        } else if view.cwd.is_empty() {
             "  (no file activity recorded)"
         } else {
-            "  (no activity matches the filter)"
+            "  (directory has no recorded activity)"
         };
         f.render_widget(
             List::new(vec![ListItem::new(message)]).block(Block::default().borders(Borders::NONE)),
@@ -174,7 +177,11 @@ pub fn draw(
                 )),
             }
             if selected {
-                highlight_selected(&mut spans);
+                if view.focus == PaneFocus::Files {
+                    highlight_selected(&mut spans);
+                } else {
+                    highlight_inactive_selected(&mut spans);
+                }
             }
             ListItem::new(Line::from(spans))
         })
@@ -241,6 +248,11 @@ pub fn draw_columns(f: &mut Frame, area: Rect) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
     use super::*;
     use crate::model::OpKind;
 
@@ -262,5 +274,40 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "a");
+    }
+
+    #[test]
+    fn inactive_file_selection_uses_subdued_background() {
+        let mut tree = FileTree::new();
+        tree.record("/file", 1, OpKind::Read, 5, 1);
+        let processes = ProcessTable::new();
+        let event_log = EventLog::new(Duration::from_secs(5));
+        let mut view = ViewState::new();
+        view.focus = PaneFocus::Processes;
+        let backend = TestBackend::new(40, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, frame.area(), &tree, &processes, &event_log, &view))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(0, 0)].bg,
+            Color::Rgb(28, 34, 45)
+        );
+    }
+
+    #[test]
+    fn column_headers_fill_profile_boundaries() {
+        for width in [59, 60, 95, 96] {
+            let backend = TestBackend::new(width, 1);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| draw_columns(frame, frame.area()))
+                .unwrap();
+            assert_ne!(
+                terminal.backend().buffer()[(width - 1, 0)].symbol(),
+                " ",
+                "width {width} left unused cells"
+            );
+        }
     }
 }

@@ -13,24 +13,77 @@ pub fn handle_key(
     process_pids: &[u32],
     should_reset: &mut bool,
 ) -> bool {
-    // If help is showing, any key dismisses it
+    handle_key_with_page_height(
+        key,
+        view,
+        flat_child_count,
+        tree_lines,
+        process_pids,
+        20,
+        should_reset,
+    )
+}
+
+/// Handle a key event using the actual visible row count for page navigation.
+pub fn handle_key_with_page_height(
+    key: KeyEvent,
+    view: &mut ViewState,
+    flat_child_count: usize,
+    tree_lines: &[TreeLine],
+    process_pids: &[u32],
+    page_height: usize,
+    should_reset: &mut bool,
+) -> bool {
+    // Help is a true modal: its first key only dismisses it.
     if view.show_help {
         view.show_help = false;
         return false;
     }
+
+    // These controls are global, including while the process pane or filter
+    // editor has focus. Esc remains contextual so an editor can be cancelled
+    // without also clearing the applied filter.
+    match key.code {
+        KeyCode::Char('q') => return true,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+        KeyCode::Char('r') => {
+            *should_reset = true;
+            return false;
+        }
+        KeyCode::Tab => {
+            view.mode = match view.mode {
+                ViewMode::Flat => ViewMode::Tree,
+                ViewMode::Tree => ViewMode::Flat,
+            };
+            view.cursor = 0;
+            return false;
+        }
+        KeyCode::Esc => {
+            if view.filter_input.is_some() {
+                view.filter_input = None;
+                view.filter_error = None;
+            } else if view.focus == PaneFocus::Processes {
+                view.focus = PaneFocus::Files;
+            } else {
+                view.filter = FilterQuery::default();
+                view.filter_error = None;
+                view.cursor = 0;
+            }
+            return false;
+        }
+        _ => {}
+    }
+
     if view.filter_input.is_some() {
         handle_filter_input(key, view);
         return false;
     }
     if view.focus == PaneFocus::Processes {
-        return handle_process_key(key, view, process_pids);
+        return handle_process_key(key, view, process_pids, page_height);
     }
 
+    let page_height = page_height.max(1);
     match key.code {
-        // Quit
-        KeyCode::Char('q') => return true,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
-
         // Navigation
         KeyCode::Up | KeyCode::Char('k') => {
             if view.cursor > 0 {
@@ -56,14 +109,14 @@ pub fn handle_key(
             };
         }
         KeyCode::PageUp => {
-            view.cursor = view.cursor.saturating_sub(20);
+            view.cursor = view.cursor.saturating_sub(page_height);
         }
         KeyCode::PageDown => {
             let max = match view.mode {
                 ViewMode::Flat => flat_child_count.saturating_sub(1),
                 ViewMode::Tree => tree_lines.len().saturating_sub(1),
             };
-            view.cursor = (view.cursor + 20).min(max);
+            view.cursor = view.cursor.saturating_add(page_height).min(max);
         }
 
         // Drill in (flat) / Expand (tree)
@@ -110,15 +163,6 @@ pub fn handle_key(
             }
         },
 
-        // Toggle view mode
-        KeyCode::Tab => {
-            view.mode = match view.mode {
-                ViewMode::Flat => ViewMode::Tree,
-                ViewMode::Tree => ViewMode::Flat,
-            };
-            view.cursor = 0;
-        }
-
         // Sort
         KeyCode::Char('s') => {
             view.sort_by = view.sort_by.next();
@@ -131,11 +175,6 @@ pub fn handle_key(
         KeyCode::Char('/') => {
             view.filter_input = Some(view.filter.raw().to_string());
             view.filter_error = None;
-        }
-        KeyCode::Esc => {
-            view.filter = FilterQuery::default();
-            view.filter_error = None;
-            view.cursor = 0;
         }
 
         // Process panel toggle
@@ -151,11 +190,6 @@ pub fn handle_key(
             view.reconcile_process_selection(process_pids);
         }
 
-        // Reset counters
-        KeyCode::Char('r') => {
-            *should_reset = true;
-        }
-
         // Help
         KeyCode::Char('?') => {
             view.show_help = true;
@@ -167,11 +201,15 @@ pub fn handle_key(
     false
 }
 
-fn handle_process_key(key: KeyEvent, view: &mut ViewState, process_pids: &[u32]) -> bool {
+fn handle_process_key(
+    key: KeyEvent,
+    view: &mut ViewState,
+    process_pids: &[u32],
+    page_height: usize,
+) -> bool {
+    let page_height = page_height.max(1);
     match key.code {
-        KeyCode::Char('q') => return true,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
-        KeyCode::Esc | KeyCode::Char('P') => view.focus = PaneFocus::Files,
+        KeyCode::Char('P') => view.focus = PaneFocus::Files,
         KeyCode::Char('p') => {
             view.show_processes = false;
             view.focus = PaneFocus::Files;
@@ -187,10 +225,14 @@ fn handle_process_key(key: KeyEvent, view: &mut ViewState, process_pids: &[u32])
         KeyCode::End | KeyCode::Char('G') => {
             view.process_cursor = process_pids.len().saturating_sub(1);
         }
-        KeyCode::PageUp => view.process_cursor = view.process_cursor.saturating_sub(20),
+        KeyCode::PageUp => {
+            view.process_cursor = view.process_cursor.saturating_sub(page_height);
+        }
         KeyCode::PageDown => {
-            view.process_cursor =
-                (view.process_cursor + 20).min(process_pids.len().saturating_sub(1));
+            view.process_cursor = view
+                .process_cursor
+                .saturating_add(page_height)
+                .min(process_pids.len().saturating_sub(1));
         }
         KeyCode::Char('s') => view.process_sort = view.process_sort.next(),
         KeyCode::Char('S') => view.process_sort_desc = !view.process_sort_desc,
@@ -324,14 +366,108 @@ mod tests {
             KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
             &mut view,
             &pids,
+            5,
         );
         assert_eq!(view.selected_process, Some(20));
         handle_process_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut view,
             &pids,
+            5,
         );
         assert_eq!(view.filter.raw(), "pid:20");
         assert_eq!(view.focus, PaneFocus::Files);
+    }
+
+    #[test]
+    fn help_consumes_drill_and_quit_keys() {
+        let mut view = ViewState::new();
+        view.show_help = true;
+        let mut reset = false;
+        let quit = handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut view,
+            3,
+            &[],
+            &[],
+            &mut reset,
+        );
+        assert!(!quit);
+        assert!(!view.show_help);
+    }
+
+    #[test]
+    fn global_keys_work_from_editor_and_process_pane() {
+        let mut view = ViewState::new();
+        view.filter_input = Some("path:tmp".into());
+        let mut reset = false;
+        handle_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut view,
+            0,
+            &[],
+            &[],
+            &mut reset,
+        );
+        assert!(reset);
+        assert!(view.filter_input.is_some());
+
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut view,
+            0,
+            &[],
+            &[],
+            &mut reset,
+        );
+        assert!(view.filter_input.is_none());
+
+        view.show_processes = true;
+        view.focus = PaneFocus::Processes;
+        handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut view,
+            0,
+            &[],
+            &[],
+            &mut reset,
+        );
+        assert_eq!(view.mode, ViewMode::Tree);
+        assert_eq!(view.focus, PaneFocus::Processes);
+
+        assert!(handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut view,
+            0,
+            &[],
+            &[],
+            &mut reset,
+        ));
+    }
+
+    #[test]
+    fn page_navigation_uses_visible_height() {
+        let mut view = ViewState::new();
+        let mut reset = false;
+        handle_key_with_page_height(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &mut view,
+            100,
+            &[],
+            &[],
+            7,
+            &mut reset,
+        );
+        assert_eq!(view.cursor, 7);
+        handle_key_with_page_height(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &mut view,
+            100,
+            &[],
+            &[],
+            7,
+            &mut reset,
+        );
+        assert_eq!(view.cursor, 0);
     }
 }

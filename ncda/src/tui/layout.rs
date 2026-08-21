@@ -1,6 +1,6 @@
 use ratatui::style::{Color, Modifier};
 use ratatui::text::Span;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WidthProfile {
@@ -20,8 +20,8 @@ impl TableColumns {
     pub fn for_width(width: u16) -> Self {
         let width = usize::from(width);
         if width >= 96 {
-            // Prefix + read/write/ops/rate/latency consume 53 cells.
-            let flexible = width.saturating_sub(53);
+            // Prefix + read/write/ops/rate/latency consume 51 cells.
+            let flexible = width.saturating_sub(51);
             let graph = (flexible / 3).clamp(10, 30);
             Self {
                 profile: WidthProfile::Full,
@@ -48,10 +48,16 @@ impl TableColumns {
 
     pub fn rendered_width(self) -> usize {
         match self.profile {
-            WidthProfile::Full => 2 + self.name + self.graph + 51,
+            WidthProfile::Full => 2 + self.name + self.graph + 49,
             WidthProfile::Compact => 2 + self.name + self.graph + 20,
             WidthProfile::Minimal => 2 + self.name + 10,
         }
+    }
+}
+
+pub fn highlight_inactive_selected(spans: &mut [Span<'_>]) {
+    for span in spans {
+        span.style = span.style.bg(Color::Rgb(28, 34, 45));
     }
 }
 
@@ -93,33 +99,102 @@ fn byte_bar(total: u64, maximum: u64, width: usize) -> String {
 }
 
 pub fn fit_display(value: &str, width: usize) -> String {
+    let mut output = truncate_display(value, width);
+    let used = UnicodeWidthStr::width(output.as_str());
+    output.push_str(&" ".repeat(width.saturating_sub(used)));
+    output
+}
+
+/// Truncate to terminal cells without splitting a combining or emoji cluster.
+pub fn truncate_display(value: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
     if UnicodeWidthStr::width(value) <= width {
-        return format!(
-            "{value}{}",
-            " ".repeat(width - UnicodeWidthStr::width(value))
-        );
+        return value.to_string();
     }
-
     if width == 1 {
         return "~".to_string();
     }
+
     let target = width - 1;
     let mut output = String::new();
     let mut used = 0;
-    for character in value.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if used + character_width > target {
+    let mut start = 0;
+    while start < value.len() {
+        let end = grapheme_end(value, start);
+        let cluster = &value[start..end];
+        let cluster_width = UnicodeWidthStr::width(cluster);
+        if used + cluster_width > target {
             break;
         }
-        output.push(character);
-        used += character_width;
+        output.push_str(cluster);
+        used += cluster_width;
+        start = end;
     }
     output.push('~');
-    output.push_str(&" ".repeat(width.saturating_sub(used + 1)));
     output
+}
+
+fn grapheme_end(value: &str, start: usize) -> usize {
+    let mut characters = value[start..].char_indices();
+    let Some((_, first)) = characters.next() else {
+        return start;
+    };
+    let mut end = start + first.len_utf8();
+    let mut after_joiner = false;
+    let mut regional_indicators = usize::from(is_regional_indicator(first));
+
+    for (offset, character) in characters {
+        let absolute = start + offset;
+        let include = if after_joiner {
+            after_joiner = character == '\u{200d}';
+            true
+        } else if character == '\u{200d}' {
+            after_joiner = true;
+            true
+        } else if is_grapheme_extend(character) {
+            true
+        } else if regional_indicators == 1 && is_regional_indicator(character) {
+            regional_indicators += 1;
+            true
+        } else {
+            false
+        };
+        if !include {
+            break;
+        }
+        end = absolute + character.len_utf8();
+    }
+    end
+}
+
+fn is_regional_indicator(character: char) -> bool {
+    ('\u{1f1e6}'..='\u{1f1ff}').contains(&character)
+}
+
+fn is_grapheme_extend(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0300}'..='\u{036f}'
+            | '\u{0483}'..='\u{0489}'
+            | '\u{0591}'..='\u{05bd}'
+            | '\u{05bf}'
+            | '\u{05c1}'..='\u{05c2}'
+            | '\u{0610}'..='\u{061a}'
+            | '\u{064b}'..='\u{065f}'
+            | '\u{0670}'
+            | '\u{06d6}'..='\u{06ed}'
+            | '\u{0900}'..='\u{0903}'
+            | '\u{093a}'..='\u{094f}'
+            | '\u{1ab0}'..='\u{1aff}'
+            | '\u{1dc0}'..='\u{1dff}'
+            | '\u{20d0}'..='\u{20ff}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{fe20}'..='\u{fe2f}'
+            | '\u{1f3fb}'..='\u{1f3ff}'
+            | '\u{e0100}'..='\u{e01ef}'
+    )
 }
 
 #[cfg(test)]
@@ -130,9 +205,9 @@ mod tests {
 
     #[test]
     fn profiles_fill_normal_terminal_widths() {
-        for width in [40, 80, 140] {
+        for width in [40, 59, 60, 95, 96, 140] {
             let columns = TableColumns::for_width(width);
-            assert_eq!(columns.rendered_width(), width as usize);
+            assert_eq!(columns.rendered_width(), width as usize, "width {width}");
         }
         assert_eq!(TableColumns::for_width(40).profile, WidthProfile::Minimal);
         assert_eq!(TableColumns::for_width(80).profile, WidthProfile::Compact);
@@ -143,6 +218,17 @@ mod tests {
     fn display_fitting_handles_wide_unicode() {
         let fitted = fit_display("📦données", 7);
         assert_eq!(UnicodeWidthStr::width(fitted.as_str()), 7);
+    }
+
+    #[test]
+    fn display_fitting_does_not_split_grapheme_clusters() {
+        let combining = truncate_display("e\u{301}xy", 2);
+        assert_eq!(combining, "e\u{301}~");
+
+        let family = "👩‍👩‍👧‍👦";
+        let emoji = truncate_display(&format!("{family}xy"), 3);
+        assert_eq!(emoji, format!("{family}~"));
+        assert_eq!(UnicodeWidthStr::width(emoji.as_str()), 3);
     }
 
     #[test]

@@ -71,25 +71,29 @@ pub fn format_bytes(b: u64) -> String {
     format_bytes_raw(b)
 }
 
-pub fn format_bytes_raw(b: u64) -> String {
-    if b >= 1_073_741_824 {
-        format!("{:.1}G", b as f64 / 1_073_741_824.0)
-    } else if b >= 1_048_576 {
-        format!("{:.1}M", b as f64 / 1_048_576.0)
-    } else if b >= 1024 {
-        format!("{:.1}K", b as f64 / 1024.0)
-    } else {
-        format!("{b}B")
-    }
+pub fn format_bytes_raw(bytes: u64) -> String {
+    format_scaled(bytes, 1024, &["B", "K", "M", "G", "T", "P", "E"])
 }
 
-pub fn format_count(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
+pub fn format_count(count: u64) -> String {
+    format_scaled(count, 1000, &["", "K", "M", "B", "T", "Q", "Qi"])
+}
+
+fn format_scaled(value: u64, base: u64, units: &[&str]) -> String {
+    let mut scaled = value as f64;
+    let mut unit = 0;
+    while scaled >= base as f64 && unit + 1 < units.len() {
+        scaled /= base as f64;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        return format!("{value}{}", units[unit]);
+    }
+    if scaled < 100.0 {
+        format!("{scaled:.1}{}", units[unit])
     } else {
-        format!("{n}")
+        format!("{scaled:.0}{}", units[unit])
     }
 }
 
@@ -102,5 +106,27 @@ pub fn format_latency(ns: u64) -> String {
         format!("{:.1}us", ns as f64 / 1_000.0)
     } else {
         format!("{ns}ns")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_units_remain_bounded_through_exabytes() {
+        assert_eq!(format_bytes(1 << 40), "1.0T");
+        assert_eq!(format_bytes(1 << 50), "1.0P");
+        assert_eq!(format_bytes(1 << 60), "1.0E");
+        assert!(format_bytes(u64::MAX).len() <= 5);
+    }
+
+    #[test]
+    fn count_units_remain_bounded_through_quintillions() {
+        assert_eq!(format_count(1_000_000_000), "1.0B");
+        assert_eq!(format_count(1_000_000_000_000), "1.0T");
+        assert_eq!(format_count(1_000_000_000_000_000), "1.0Q");
+        assert_eq!(format_count(1_000_000_000_000_000_000), "1.0Qi");
+        assert!(format_count(u64::MAX).len() <= 6);
     }
 }
