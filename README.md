@@ -4,6 +4,12 @@
 
 Built with [Aya](https://aya-rs.dev/) and [Ratatui](https://ratatui.rs/).
 
+## Demo
+
+![ncda monitoring live Linux file I/O](docs/assets/ncda-demo.gif)
+
+The recording uses real eBPF events from the reproducible [VHS tape](docs/demo.tape) and [demo workload](scripts/demo-workload.sh).
+
 ## Requirements
 
 - Linux 6.1 or newer (supported and tested baseline)
