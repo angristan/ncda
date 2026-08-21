@@ -137,9 +137,34 @@ impl AppState {
                     new_fd,
                     emitted_ns: _,
                 } => {
-                    if let Some(path) = self.resolve_io_path(pid, old_fd) {
+                    let source_path = self.resolve_io_path(pid, old_fd);
+                    if old_fd != new_fd {
+                        // dup2/dup3 atomically close an existing target. Clear
+                        // it even when the source is a non-file descriptor.
+                        self.fd_cache.on_close(pid, new_fd);
+                    }
+                    if let Some(path) = source_path {
                         self.fd_cache.store(pid, new_fd, path);
                     }
+                }
+                BpfEvent::CloseRange {
+                    pid,
+                    tid: _,
+                    first_fd,
+                    last_fd,
+                    flags: _,
+                    emitted_ns: _,
+                } => {
+                    // Invalidating CLOSE_RANGE_CLOEXEC entries early is safe:
+                    // surviving files are re-resolved on their next I/O.
+                    self.fd_cache.on_close_range(pid, first_fd, last_fd);
+                }
+                BpfEvent::ProcessExec { pid, emitted_ns: _ }
+                | BpfEvent::ProcessExit { pid, emitted_ns: _ } => {
+                    self.fd_cache.on_process_reset(pid);
+                    self.containers.invalidate_pid(pid);
+                    self.process_table.remove(pid);
+                    self.tree.remove_process(pid);
                 }
             }
         }
@@ -295,6 +320,39 @@ mod tests {
 
         assert!(state.tree.root.children.is_empty());
         assert_eq!(state.fd_cache.lookup(pid, 3), None);
+    }
+
+    #[test]
+    fn dup_from_non_file_clears_existing_target() {
+        let mut state = AppState::new(Duration::from_secs(5), Vec::new());
+        let pid = u32::MAX;
+        state.fd_cache.store(pid, 4, "/tmp/stale".to_string());
+        state.ingest(vec![BpfEvent::Dup {
+            pid,
+            tid: pid,
+            old_fd: 3,
+            new_fd: 4,
+            emitted_ns: 1,
+        }]);
+
+        assert_eq!(state.fd_cache.lookup(pid, 4), None);
+    }
+
+    #[test]
+    fn process_lifecycle_event_purges_pid_scoped_state() {
+        let mut state = AppState::new(Duration::from_secs(5), Vec::new());
+        let pid = u32::MAX;
+        state.fd_cache.store(pid, 3, "/tmp/file".to_string());
+        state.tree.record("/tmp/file", pid, OpKind::Read, 8, 1);
+        state.process_table.record(pid, OpKind::Read, 8, 1);
+
+        state.ingest(vec![BpfEvent::ProcessExec { pid, emitted_ns: 1 }]);
+
+        assert_eq!(state.fd_cache.lookup(pid, 3), None);
+        assert!(!state.process_table.processes.contains_key(&pid));
+        let file = &state.tree.root.children["tmp"].children["file"];
+        assert!(!file.per_process.contains_key(&pid));
+        assert_eq!(file.agg_stats.read_bytes, 8);
     }
 
     #[test]

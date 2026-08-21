@@ -2,6 +2,11 @@ use anyhow::{anyhow, Context as _};
 use aya_build::Toolchain;
 
 fn main() -> anyhow::Result<()> {
+    println!("cargo:rerun-if-changed=../ncda-ebpf/src");
+    println!("cargo:rerun-if-changed=../ncda-ebpf/Cargo.toml");
+    println!("cargo:rerun-if-changed=../ncda-common/src");
+    println!("cargo:rerun-if-changed=../ncda-common/Cargo.toml");
+
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
         .no_deps()
         .exec()

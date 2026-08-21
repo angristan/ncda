@@ -9,6 +9,9 @@ pub const EVENT_READ: u32 = 2;
 pub const EVENT_WRITE: u32 = 3;
 pub const EVENT_CLOSE: u32 = 4;
 pub const EVENT_DUP: u32 = 5;
+pub const EVENT_CLOSE_RANGE: u32 = 6;
+pub const EVENT_PROCESS_EXEC: u32 = 7;
+pub const EVENT_PROCESS_EXIT: u32 = 8;
 
 /// Open event — includes the filename captured at openat() time.
 /// Sent from eBPF to userspace via RingBuf.
@@ -63,6 +66,34 @@ pub struct FdEvent {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for FdEvent {}
 
+/// Successful close_range lifecycle transition.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RangeEvent {
+    pub kind: u32,
+    pub pid: u32,
+    pub tid: u32,
+    pub first_fd: u32,
+    pub last_fd: u32,
+    pub flags: u32,
+    pub emitted_ns: u64,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for RangeEvent {}
+
+/// Process-wide lifecycle transition used for exec and exit cleanup.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProcessEvent {
+    pub kind: u32,
+    pub pid: u32,
+    pub emitted_ns: u64,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ProcessEvent {}
+
 /// Stash for openat/openat2 entry → exit correlation.
 /// Stored in a HashMap keyed by pid_tgid.
 #[repr(C)]
@@ -91,6 +122,16 @@ pub struct FdArgs {
     pub _pad: u32,
 }
 
+/// Stash for close_range entry → exit correlation.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RangeArgs {
+    pub first_fd: u32,
+    pub last_fd: u32,
+    pub flags: u32,
+    pub _pad: u32,
+}
+
 /// Per-CPU kernel capture failure counters.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -112,4 +153,6 @@ unsafe impl aya::Pod for CaptureStats {}
 const _: [(); 288] = [(); core::mem::size_of::<OpenEvent>()];
 const _: [(); 40] = [(); core::mem::size_of::<IoEvent>()];
 const _: [(); 32] = [(); core::mem::size_of::<FdEvent>()];
+const _: [(); 32] = [(); core::mem::size_of::<RangeEvent>()];
+const _: [(); 16] = [(); core::mem::size_of::<ProcessEvent>()];
 const _: [(); 56] = [(); core::mem::size_of::<CaptureStats>()];

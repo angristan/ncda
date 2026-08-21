@@ -65,6 +65,10 @@ impl ContainerResolver {
         self.pid_cache.get(&pid)?.as_ref().map(|s| s.as_str())
     }
 
+    pub fn invalidate_pid(&mut self, pid: u32) {
+        self.pid_cache.remove(&pid);
+    }
+
     fn lookup_pid(&self, pid: u32) -> Option<String> {
         let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
         let line = cgroup.lines().next()?;

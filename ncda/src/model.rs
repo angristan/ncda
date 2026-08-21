@@ -206,6 +206,11 @@ impl FileTree {
     pub fn reset(&mut self) {
         reset_node(&mut self.root);
     }
+
+    /// Remove PID-scoped breakdowns when a process generation ends.
+    pub fn remove_process(&mut self, pid: u32) {
+        remove_process_from_node(&mut self.root, pid);
+    }
 }
 
 fn apply_stats(stats: &mut NodeStats, op: OpKind, bytes: u64, latency_ns: u64) {
@@ -228,6 +233,13 @@ fn apply_stats(stats: &mut NodeStats, op: OpKind, bytes: u64, latency_ns: u64) {
         OpKind::Close => {
             stats.close_ops += 1;
         }
+    }
+}
+
+fn remove_process_from_node(node: &mut TreeNode, pid: u32) {
+    node.per_process.remove(&pid);
+    for child in node.children.values_mut() {
+        remove_process_from_node(child, pid);
     }
 }
 

@@ -53,6 +53,22 @@ pub enum BpfEvent {
         new_fd: u32,
         emitted_ns: u64,
     },
+    CloseRange {
+        pid: u32,
+        tid: u32,
+        first_fd: u32,
+        last_fd: u32,
+        flags: u32,
+        emitted_ns: u64,
+    },
+    ProcessExec {
+        pid: u32,
+        emitted_ns: u64,
+    },
+    ProcessExit {
+        pid: u32,
+        emitted_ns: u64,
+    },
 }
 
 /// Lock-free counters updated by the ring-buffer reader.
@@ -104,7 +120,12 @@ pub fn capture_stats(map: &PerCpuArray<MapData, CaptureStats>) -> Result<Capture
 
 /// Load and globally attach the architecture-specific raw syscall decoder.
 pub fn load_and_attach(ebpf: &mut Ebpf) -> Result<()> {
-    for (program_name, tracepoint_name) in [("sys_enter", "sys_enter"), ("sys_exit", "sys_exit")] {
+    for (program_name, tracepoint_name) in [
+        ("sys_enter", "sys_enter"),
+        ("sys_exit", "sys_exit"),
+        ("sched_process_exec", "sched_process_exec"),
+        ("sched_process_exit", "sched_process_exit"),
+    ] {
         let program: &mut RawTracePoint = ebpf
             .program_mut(program_name)
             .with_context(|| format!("program {program_name} not found"))?
@@ -194,6 +215,8 @@ fn parse_event(data: &[u8]) -> Option<BpfEvent> {
         EVENT_WRITE => parse_io_event(data, EVENT_WRITE),
         EVENT_CLOSE => parse_io_event(data, EVENT_CLOSE),
         EVENT_DUP => parse_fd_event(data),
+        EVENT_CLOSE_RANGE => parse_range_event(data),
+        EVENT_PROCESS_EXEC | EVENT_PROCESS_EXIT => parse_process_event(data, kind),
         _ => {
             debug!("unknown event kind: {kind}");
             None
@@ -286,6 +309,34 @@ fn parse_fd_event(data: &[u8]) -> Option<BpfEvent> {
     })
 }
 
+fn parse_range_event(data: &[u8]) -> Option<BpfEvent> {
+    if data.len() < core::mem::size_of::<RangeEvent>() {
+        return None;
+    }
+
+    Some(BpfEvent::CloseRange {
+        pid: u32::from_ne_bytes(data[4..8].try_into().ok()?),
+        tid: u32::from_ne_bytes(data[8..12].try_into().ok()?),
+        first_fd: u32::from_ne_bytes(data[12..16].try_into().ok()?),
+        last_fd: u32::from_ne_bytes(data[16..20].try_into().ok()?),
+        flags: u32::from_ne_bytes(data[20..24].try_into().ok()?),
+        emitted_ns: u64::from_ne_bytes(data[24..32].try_into().ok()?),
+    })
+}
+
+fn parse_process_event(data: &[u8], kind: u32) -> Option<BpfEvent> {
+    if data.len() < core::mem::size_of::<ProcessEvent>() {
+        return None;
+    }
+    let pid = u32::from_ne_bytes(data[4..8].try_into().ok()?);
+    let emitted_ns = u64::from_ne_bytes(data[8..16].try_into().ok()?);
+    match kind {
+        EVENT_PROCESS_EXEC => Some(BpfEvent::ProcessExec { pid, emitted_ns }),
+        EVENT_PROCESS_EXIT => Some(BpfEvent::ProcessExit { pid, emitted_ns }),
+        _ => None,
+    }
+}
+
 /// Fd-to-path cache maintained in userspace.
 /// Maps (pid, fd) → path string.
 ///
@@ -334,6 +385,16 @@ impl FdPathCache {
 
     pub fn on_close(&mut self, pid: u32, fd: u32) {
         self.map.remove(&(pid, fd));
+    }
+
+    pub fn on_close_range(&mut self, pid: u32, first_fd: u32, last_fd: u32) {
+        self.map
+            .retain(|(entry_pid, fd), _| *entry_pid != pid || *fd < first_fd || *fd > last_fd);
+    }
+
+    pub fn on_process_reset(&mut self, pid: u32) {
+        self.map.retain(|(entry_pid, _), _| *entry_pid != pid);
+        self.root_cache.remove(&pid);
     }
 
     pub fn lookup(&self, pid: u32, fd: u32) -> Option<&str> {
@@ -499,6 +560,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<OpenEvent>(), 288);
         assert_eq!(core::mem::size_of::<IoEvent>(), 40);
         assert_eq!(core::mem::size_of::<FdEvent>(), 32);
+        assert_eq!(core::mem::size_of::<RangeEvent>(), 32);
+        assert_eq!(core::mem::size_of::<ProcessEvent>(), 16);
         assert_eq!(core::mem::size_of::<CaptureStats>(), 56);
     }
 
@@ -566,6 +629,59 @@ mod tests {
                 emitted_ns: 456,
             })
         ));
+
+        let mut range = [0_u8; 32];
+        range[0..4].copy_from_slice(&EVENT_CLOSE_RANGE.to_ne_bytes());
+        range[4..8].copy_from_slice(&7_u32.to_ne_bytes());
+        range[8..12].copy_from_slice(&8_u32.to_ne_bytes());
+        range[12..16].copy_from_slice(&9_u32.to_ne_bytes());
+        range[16..20].copy_from_slice(&12_u32.to_ne_bytes());
+        range[20..24].copy_from_slice(&2_u32.to_ne_bytes());
+        range[24..32].copy_from_slice(&789_u64.to_ne_bytes());
+        assert!(matches!(
+            parse_event(&range),
+            Some(BpfEvent::CloseRange {
+                pid: 7,
+                tid: 8,
+                first_fd: 9,
+                last_fd: 12,
+                flags: 2,
+                emitted_ns: 789,
+            })
+        ));
+
+        let mut process = [0_u8; 16];
+        process[0..4].copy_from_slice(&EVENT_PROCESS_EXEC.to_ne_bytes());
+        process[4..8].copy_from_slice(&7_u32.to_ne_bytes());
+        process[8..16].copy_from_slice(&999_u64.to_ne_bytes());
+        assert!(matches!(
+            parse_event(&process),
+            Some(BpfEvent::ProcessExec {
+                pid: 7,
+                emitted_ns: 999,
+            })
+        ));
+    }
+
+    #[test]
+    fn close_range_and_process_reset_purge_cached_descriptors() {
+        let mut cache = FdPathCache::new();
+        for fd in 3..=7 {
+            cache.store(42, fd, format!("/tmp/{fd}"));
+        }
+        cache.store(43, 5, "/tmp/other".to_string());
+
+        cache.on_close_range(42, 4, 6);
+        assert!(cache.lookup(42, 3).is_some());
+        assert!(cache.lookup(42, 4).is_none());
+        assert!(cache.lookup(42, 6).is_none());
+        assert!(cache.lookup(42, 7).is_some());
+        assert!(cache.lookup(43, 5).is_some());
+
+        cache.on_process_reset(42);
+        assert!(cache.lookup(42, 3).is_none());
+        assert!(cache.lookup(42, 7).is_none());
+        assert!(cache.lookup(43, 5).is_some());
     }
 
     #[test]

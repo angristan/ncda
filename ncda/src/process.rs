@@ -132,6 +132,10 @@ impl ProcessTable {
         processes
     }
 
+    pub fn remove(&mut self, pid: u32) {
+        self.processes.remove(&pid);
+    }
+
     pub fn reset(&mut self) {
         self.processes.clear();
     }

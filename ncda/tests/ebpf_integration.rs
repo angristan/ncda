@@ -199,12 +199,50 @@ async fn captures_extended_fd_lifecycle_without_loss() {
     assert_eq!(dup2_fd, 1001);
     let dup3_fd = unsafe { libc::dup3(fd, 1002, libc::O_CLOEXEC) };
     assert_eq!(dup3_fd, 1002);
+    let fcntl_dup_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 1003) };
+    assert_eq!(fcntl_dup_fd, 1003);
+    let cloexec_range_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 1004) };
+    assert_eq!(cloexec_range_fd, 1004);
 
-    let known_fds: HashSet<u32> = [fd, openat2_fd, preexisting_fd, dup_fd, dup2_fd, dup3_fd]
-        .into_iter()
-        .map(|fd| fd as u32)
-        .collect();
-    for descriptor in [dup_fd, dup2_fd, dup3_fd, openat2_fd, fd, preexisting_fd] {
+    assert_eq!(
+        unsafe { libc::syscall(libc::SYS_close_range, fcntl_dup_fd, fcntl_dup_fd, 0) },
+        0
+    );
+    const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+    assert_eq!(
+        unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                cloexec_range_fd,
+                cloexec_range_fd,
+                CLOSE_RANGE_CLOEXEC,
+            )
+        },
+        0
+    );
+
+    let known_fds: HashSet<u32> = [
+        fd,
+        openat2_fd,
+        preexisting_fd,
+        dup_fd,
+        dup2_fd,
+        dup3_fd,
+        fcntl_dup_fd,
+        cloexec_range_fd,
+    ]
+    .into_iter()
+    .map(|fd| fd as u32)
+    .collect();
+    for descriptor in [
+        dup_fd,
+        dup2_fd,
+        dup3_fd,
+        cloexec_range_fd,
+        openat2_fd,
+        fd,
+        preexisting_fd,
+    ] {
         assert_eq!(unsafe { libc::close(descriptor) }, 0);
     }
 
@@ -230,6 +268,7 @@ async fn captures_extended_fd_lifecycle_without_loss() {
     let mut write_bytes = 0;
     let mut dup_targets = HashSet::new();
     let mut closes = HashSet::new();
+    let mut closed_ranges = HashSet::new();
     for event in &events {
         match event {
             BpfEvent::Read {
@@ -269,13 +308,32 @@ async fn captures_extended_fd_lifecycle_without_loss() {
             } if *event_pid == pid && known_fds.contains(fd) => {
                 closes.insert(*fd);
             }
+            BpfEvent::CloseRange {
+                pid: event_pid,
+                first_fd,
+                last_fd,
+                flags,
+                ..
+            } if *event_pid == pid => {
+                closed_ranges.insert((*first_fd, *last_fd, *flags));
+            }
             _ => {}
         }
     }
     assert_eq!((read_ops, read_bytes), (6, 48));
     assert_eq!((write_ops, write_bytes), (6, 48));
-    assert_eq!(dup_targets, HashSet::from([dup_fd as u32, 1001, 1002]));
-    assert_eq!(closes, known_fds);
+    assert_eq!(
+        dup_targets,
+        HashSet::from([dup_fd as u32, 1001, 1002, 1003, 1004])
+    );
+    let expected_closes = known_fds
+        .iter()
+        .copied()
+        .filter(|fd| *fd != fcntl_dup_fd as u32)
+        .collect::<HashSet<_>>();
+    assert_eq!(closes, expected_closes);
+    assert!(closed_ranges.contains(&(1003, 1003, 0)));
+    assert!(closed_ranges.contains(&(1004, 1004, CLOSE_RANGE_CLOEXEC)));
 
     let kernel = bpf::capture_stats(&capture_stats).unwrap();
     let userspace = reader_drops.snapshot();

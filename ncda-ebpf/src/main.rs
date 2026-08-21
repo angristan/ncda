@@ -24,6 +24,8 @@ mod arch {
     pub const DUP: i64 = 32;
     pub const DUP2: i64 = 33;
     pub const DUP3: i64 = 292;
+    pub const FCNTL: i64 = 72;
+    pub const CLOSE_RANGE: i64 = 436;
     pub const PREADV: i64 = 295;
     pub const PWRITEV: i64 = 296;
     pub const PREADV2: i64 = 327;
@@ -46,6 +48,8 @@ mod arch {
     // arm64 has no native dup2; libc implements it with dup3.
     pub const DUP2: i64 = -1;
     pub const DUP3: i64 = 24;
+    pub const FCNTL: i64 = 25;
+    pub const CLOSE_RANGE: i64 = 436;
     pub const PREADV: i64 = 69;
     pub const PWRITEV: i64 = 70;
     pub const PREADV2: i64 = 286;
@@ -68,6 +72,8 @@ static IO_STASH: HashMap<u64, RwArgs> = HashMap::with_max_entries(8192, 0);
 static CLOSE_STASH: HashMap<u64, FdArgs> = HashMap::with_max_entries(8192, 0);
 #[map]
 static DUP_STASH: HashMap<u64, FdArgs> = HashMap::with_max_entries(8192, 0);
+#[map]
+static RANGE_STASH: HashMap<u64, RangeArgs> = HashMap::with_max_entries(8192, 0);
 #[map]
 static SCRATCH: PerCpuArray<OpenArgs> = PerCpuArray::with_max_entries(1, 0);
 #[map]
@@ -153,6 +159,10 @@ pub fn sys_enter(ctx: RawTracePointContext) -> i32 {
         enter_fd(registers, pid_tgid, &CLOSE_STASH);
     } else if syscall == arch::DUP || syscall == arch::DUP2 || syscall == arch::DUP3 {
         enter_fd(registers, pid_tgid, &DUP_STASH);
+    } else if syscall == arch::FCNTL {
+        enter_fcntl(registers, pid_tgid);
+    } else if syscall == arch::CLOSE_RANGE {
+        enter_close_range(registers, pid_tgid);
     }
     0
 }
@@ -204,6 +214,29 @@ fn enter_fd(registers: *const u64, pid_tgid: u64, stash: &HashMap<u64, FdArgs>) 
     }
 }
 
+#[inline(always)]
+fn enter_fcntl(registers: *const u64, pid_tgid: u64) {
+    const F_DUPFD: u64 = 0;
+    const F_DUPFD_CLOEXEC: u64 = 1030;
+    let command = unsafe { syscall_arg(registers, 1) };
+    if command == F_DUPFD || command == F_DUPFD_CLOEXEC {
+        enter_fd(registers, pid_tgid, &DUP_STASH);
+    }
+}
+
+#[inline(always)]
+fn enter_close_range(registers: *const u64, pid_tgid: u64) {
+    let args = RangeArgs {
+        first_fd: unsafe { syscall_arg(registers, 0) } as u32,
+        last_fd: unsafe { syscall_arg(registers, 1) } as u32,
+        flags: unsafe { syscall_arg(registers, 2) } as u32,
+        _pad: 0,
+    };
+    if RANGE_STASH.insert(&pid_tgid, &args, 0).is_err() {
+        record_stash_failure();
+    }
+}
+
 #[raw_tracepoint(tracepoint = "sys_exit")]
 pub fn sys_exit(ctx: RawTracePointContext) -> i32 {
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -228,6 +261,15 @@ pub fn sys_exit(ctx: RawTracePointContext) -> i32 {
         let old_fd = args.fd;
         let _ = DUP_STASH.remove(&pid_tgid);
         exit_dup(pid_tgid, result, old_fd);
+    } else if let Some(args) = unsafe { RANGE_STASH.get(&pid_tgid) } {
+        let args = RangeArgs {
+            first_fd: args.first_fd,
+            last_fd: args.last_fd,
+            flags: args.flags,
+            _pad: 0,
+        };
+        let _ = RANGE_STASH.remove(&pid_tgid);
+        exit_close_range(pid_tgid, result, &args);
     } else {
         // Untracked syscalls intentionally have no stash entry.
     }
@@ -322,6 +364,55 @@ fn exit_dup(pid_tgid: u64, result: i64, old_fd: u32) {
     if EVENTS.output::<FdEvent>(&event, 0).is_err() {
         record_ring_drop();
     }
+}
+
+#[inline(always)]
+fn exit_close_range(pid_tgid: u64, result: i64, args: &RangeArgs) {
+    if result != 0 {
+        return;
+    }
+    let event = RangeEvent {
+        kind: EVENT_CLOSE_RANGE,
+        pid: (pid_tgid >> 32) as u32,
+        tid: pid_tgid as u32,
+        first_fd: args.first_fd,
+        last_fd: args.last_fd,
+        flags: args.flags,
+        emitted_ns: unsafe { bpf_ktime_get_ns() },
+    };
+    if EVENTS.output::<RangeEvent>(&event, 0).is_err() {
+        record_ring_drop();
+    }
+}
+
+#[inline(always)]
+fn emit_process_event(kind: u32) {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let tid = pid_tgid as u32;
+    if pid != tid {
+        return;
+    }
+    let event = ProcessEvent {
+        kind,
+        pid,
+        emitted_ns: unsafe { bpf_ktime_get_ns() },
+    };
+    if EVENTS.output::<ProcessEvent>(&event, 0).is_err() {
+        record_ring_drop();
+    }
+}
+
+#[raw_tracepoint(tracepoint = "sched_process_exec")]
+pub fn sched_process_exec(_ctx: RawTracePointContext) -> i32 {
+    emit_process_event(EVENT_PROCESS_EXEC);
+    0
+}
+
+#[raw_tracepoint(tracepoint = "sched_process_exit")]
+pub fn sched_process_exit(_ctx: RawTracePointContext) -> i32 {
+    emit_process_event(EVENT_PROCESS_EXIT);
+    0
 }
 
 #[cfg(not(test))]
