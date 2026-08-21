@@ -68,7 +68,7 @@ Byte counts, operation counts, rates, and average syscall latency include only s
 
 Path attribution is fail-safe. Descriptor replacement, range close, exec, and exit invalidate cached state. If a delayed relative open no longer matches the current descriptor target, activity is placed under `/[unresolved]/pid-<pid>/fd-<fd>/` instead of being assigned to a possibly wrong file. `Attr` counts attribution failures. Anonymous memory files are grouped under `/[memory]/`; sockets, pipes, and other non-file pseudo descriptors are hidden.
 
-`Drops` reports kernel ring/stash/scratch loss and userspace parse/queue loss. Any non-zero drop count means displayed activity is incomplete.
+`Drops` reports kernel ring/stash/scratch loss and userspace parse/queue loss. Any non-zero drop count means displayed activity is incomplete. On exit, ncda still drains the kernel ring but discards pending aggregation work because output has already closed; verbose logs report that intentional discard count.
 
 ## Benchmarking
 

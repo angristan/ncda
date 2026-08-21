@@ -79,12 +79,14 @@ pub enum BpfEvent {
 pub struct ReaderDropCounters {
     parse_drops: AtomicU64,
     queue_drops: AtomicU64,
+    shutdown_discarded: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReaderDropSnapshot {
     pub parse_drops: u64,
     pub queue_drops: u64,
+    pub shutdown_discarded: u64,
 }
 
 impl ReaderDropCounters {
@@ -92,16 +94,27 @@ impl ReaderDropCounters {
         ReaderDropSnapshot {
             parse_drops: self.parse_drops.load(Ordering::Relaxed),
             queue_drops: self.queue_drops.load(Ordering::Relaxed),
+            shutdown_discarded: self.shutdown_discarded.load(Ordering::Relaxed),
         }
     }
 
     fn record_parse_drop(&self) {
-        self.parse_drops.fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_add(&self.parse_drops, 1);
     }
 
     fn record_queue_drops(&self, count: usize) {
-        self.queue_drops.fetch_add(count as u64, Ordering::Relaxed);
+        saturating_atomic_add(&self.queue_drops, count as u64);
     }
+
+    pub fn record_shutdown_discarded(&self, count: usize) {
+        saturating_atomic_add(&self.shutdown_discarded, count as u64);
+    }
+}
+
+fn saturating_atomic_add(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(amount))
+    });
 }
 
 /// Sum the kernel's per-CPU capture failure counters.
@@ -607,6 +620,7 @@ mod tests {
             ReaderDropSnapshot {
                 parse_drops: 1,
                 queue_drops: 3,
+                shutdown_discarded: 0,
             }
         );
     }

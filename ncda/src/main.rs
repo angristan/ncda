@@ -1,6 +1,7 @@
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use aya::maps::{MapData, PerCpuArray, RingBuf};
@@ -107,11 +108,18 @@ async fn main() -> Result<()> {
         reader_drops.clone(),
     ));
 
+    let discard_pending = Arc::new(AtomicBool::new(false));
+    let agg_discard_pending = Arc::clone(&discard_pending);
+    let agg_reader_drops = Arc::clone(&reader_drops);
     let agg_state = state.clone();
     let aggregator_handle = tokio::spawn(async move {
         while let Some(batch) = rx.recv().await {
-            let mut state = agg_state.lock().unwrap();
-            state.ingest(batch);
+            handle_aggregator_batch(
+                &agg_state,
+                batch,
+                agg_discard_pending.load(Ordering::Acquire),
+                &agg_reader_drops,
+            );
         }
     });
 
@@ -131,24 +139,37 @@ async fn main() -> Result<()> {
         run_tui_mode(state.clone())
     };
 
-    // Stop enrichment and detach producers, then drain and aggregate every
-    // event already queued in the kernel and userspace.
+    // Stop expensive aggregation as soon as output ends. The reader still
+    // drains every kernel record, while the aggregator counts and discards
+    // pending batches instead of rebuilding state that will never be shown.
+    let shutdown_started = Instant::now();
+    discard_pending.store(true, Ordering::Release);
     let _ = container_shutdown_tx.send(true);
     drop(ebpf);
     let _ = reader_shutdown_tx.send(true);
     reader_handle.await.context("BPF reader task panicked")??;
+    info!("ring drained in {:?}", shutdown_started.elapsed());
     aggregator_handle
         .await
         .context("aggregator task panicked")?;
+    info!("queue closed in {:?}", shutdown_started.elapsed());
 
     container_handle
         .await
         .context("container discovery task panicked")??;
+    info!("enrichment stopped in {:?}", shutdown_started.elapsed());
 
     let _ = stats_shutdown_tx.send(true);
     let final_drops = stats_handle
         .await
         .context("capture stats task panicked")??;
+    info!("shutdown completed in {:?}", shutdown_started.elapsed());
+    if final_drops.shutdown_discarded > 0 {
+        info!(
+            "discarded {} pending events after output closed",
+            final_drops.shutdown_discarded
+        );
+    }
     if final_drops.total() > 0 {
         warn!(
             "capture lost {} events (ring={}, stash={}, scratch={}, parse={}, queue={})",
@@ -171,6 +192,7 @@ struct DropSnapshot {
     scratch_failures: u64,
     parse_drops: u64,
     queue_drops: u64,
+    shutdown_discarded: u64,
 }
 
 impl DropSnapshot {
@@ -180,6 +202,19 @@ impl DropSnapshot {
             + self.scratch_failures
             + self.parse_drops
             + self.queue_drops
+    }
+}
+
+fn handle_aggregator_batch(
+    state: &Mutex<AppState>,
+    batch: Vec<BpfEvent>,
+    discard: bool,
+    counters: &ReaderDropCounters,
+) {
+    if discard {
+        counters.record_shutdown_discarded(batch.len());
+    } else {
+        state.lock().unwrap().ingest(batch);
     }
 }
 
@@ -231,6 +266,7 @@ async fn monitor_drop_counters(
             scratch_failures: kernel.scratch_failures,
             parse_drops: reader.parse_drops,
             queue_drops: reader.queue_drops,
+            shutdown_discarded: reader.shutdown_discarded,
         };
         state.lock().unwrap().update_drop_total(snapshot.total());
 
@@ -353,8 +389,27 @@ mod tests {
             scratch_failures: 3,
             parse_drops: 4,
             queue_drops: 5,
+            shutdown_discarded: 99,
         };
 
         assert_eq!(snapshot.total(), 15);
+    }
+
+    #[test]
+    fn shutdown_batches_are_counted_without_aggregation() {
+        let state = Mutex::new(AppState::new(Duration::from_secs(5), Vec::new()));
+        let counters = ReaderDropCounters::default();
+        let event = BpfEvent::ProcessExit {
+            pid: 42,
+            emitted_ns: 1,
+        };
+
+        handle_aggregator_batch(&state, vec![event.clone()], true, &counters);
+        assert_eq!(state.lock().unwrap().total_events, 0);
+        assert_eq!(counters.snapshot().shutdown_discarded, 1);
+
+        handle_aggregator_batch(&state, vec![event], false, &counters);
+        assert_eq!(state.lock().unwrap().total_events, 1);
+        assert_eq!(counters.snapshot().shutdown_discarded, 1);
     }
 }

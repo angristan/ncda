@@ -342,6 +342,7 @@ async fn captures_extended_fd_lifecycle_without_loss() {
     assert_eq!(kernel.scratch_failures, 0);
     assert_eq!(userspace.parse_drops, 0);
     assert_eq!(userspace.queue_drops, 0);
+    assert_eq!(userspace.shutdown_discarded, 0);
 }
 
 fn raise_memlock_limit() {

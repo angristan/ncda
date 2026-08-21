@@ -184,6 +184,7 @@ struct DropReport {
     kernel_scratch: u64,
     userspace_parse: u64,
     userspace_queue: u64,
+    shutdown_discarded: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -355,6 +356,7 @@ async fn main() -> Result<()> {
             kernel_scratch: kernel.scratch_failures,
             userspace_parse: userspace.parse_drops,
             userspace_queue: userspace.queue_drops,
+            shutdown_discarded: userspace.shutdown_discarded,
         },
         counter_scope: CounterScope {
             observed_events: "benchmark PID, events emitted during the measurement interval",
@@ -530,6 +532,9 @@ fn subtract_drop_snapshot(
     ReaderDropSnapshot {
         parse_drops: end.parse_drops.saturating_sub(start.parse_drops),
         queue_drops: end.queue_drops.saturating_sub(start.queue_drops),
+        shutdown_discarded: end
+            .shutdown_discarded
+            .saturating_sub(start.shutdown_discarded),
     }
 }
 
@@ -623,13 +628,16 @@ mod tests {
             ReaderDropSnapshot {
                 parse_drops: 12,
                 queue_drops: 8,
+                shutdown_discarded: 7,
             },
             ReaderDropSnapshot {
                 parse_drops: 10,
                 queue_drops: 9,
+                shutdown_discarded: 4,
             },
         );
         assert_eq!(userspace.parse_drops, 2);
         assert_eq!(userspace.queue_drops, 0);
+        assert_eq!(userspace.shutdown_discarded, 3);
     }
 }
