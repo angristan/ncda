@@ -191,7 +191,7 @@ async fn monitor_drop_counters(
             parse_drops: reader.parse_drops,
             queue_drops: reader.queue_drops,
         };
-        state.lock().unwrap().dropped_events = snapshot.total();
+        state.lock().unwrap().update_drop_total(snapshot.total());
 
         if *shutdown.borrow() {
             return Ok(snapshot);
@@ -247,9 +247,12 @@ async fn run_stdout_mode(state: Arc<Mutex<AppState>>) -> Result<()> {
                 let s = state.lock().unwrap();
                 let root = &s.tree.root;
                 println!(
-                    "Events:{:>8} | Drops:{:>6} | R:{:>10} W:{:>10} | Ops:{:>8} | FDs cached:{:>6}",
+                    "Events:{:>8} | Drops:{:>6} | Attr:{:>6} | Err:{:>6} Zero:{:>6} | R:{:>10} W:{:>10} | Ops:{:>8} | FDs cached:{:>6}",
                     s.total_events,
                     s.dropped_events,
+                    s.attribution_failures,
+                    s.failed_io_events,
+                    s.zero_byte_io_events,
                     ncda::tui::footer::format_bytes(root.agg_stats.read_bytes),
                     ncda::tui::footer::format_bytes(root.agg_stats.write_bytes),
                     ncda::tui::footer::format_count(root.agg_stats.total_ops()),

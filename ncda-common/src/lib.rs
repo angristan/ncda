@@ -42,7 +42,7 @@ pub struct IoEvent {
     pub pid: u32,
     pub tid: u32,
     pub fd: u32,
-    pub bytes: u64,
+    pub result: i64,
     pub latency_ns: u64,
     pub emitted_ns: u64,
 }

@@ -202,9 +202,9 @@ impl FileTree {
         Some(node)
     }
 
-    /// Reset all stats in the tree.
+    /// Reset all activity and release historical path/process topology.
     pub fn reset(&mut self) {
-        reset_node(&mut self.root);
+        self.root = TreeNode::new("/".into(), true);
     }
 
     /// Remove PID-scoped breakdowns when a process generation ends.
@@ -240,15 +240,6 @@ fn remove_process_from_node(node: &mut TreeNode, pid: u32) {
     node.per_process.remove(&pid);
     for child in node.children.values_mut() {
         remove_process_from_node(child, pid);
-    }
-}
-
-fn reset_node(node: &mut TreeNode) {
-    node.stats.reset();
-    node.agg_stats.reset();
-    node.per_process.clear();
-    for child in node.children.values_mut() {
-        reset_node(child);
     }
 }
 
@@ -319,23 +310,16 @@ mod tests {
     }
 
     #[test]
-    fn reset_keeps_topology_and_clears_all_statistics() {
+    fn reset_releases_historical_topology() {
         let mut tree = FileTree::new();
         tree.record("/a/b", 7, OpKind::Read, 11, 13);
         tree.record("/a/c", 8, OpKind::Write, 17, 19);
 
         tree.reset();
 
-        assert!(tree.get_node(&["a".into(), "b".into()]).is_some());
-        assert_aggregate_invariants(&tree.root);
-        fn assert_reset(node: &TreeNode) {
-            assert_eq!(node.stats, NodeStats::default());
-            assert_eq!(node.agg_stats, NodeStats::default());
-            assert!(node.per_process.is_empty());
-            for child in node.children.values() {
-                assert_reset(child);
-            }
-        }
-        assert_reset(&tree.root);
+        assert!(tree.root.children.is_empty());
+        assert_eq!(tree.root.stats, NodeStats::default());
+        assert_eq!(tree.root.agg_stats, NodeStats::default());
+        assert!(tree.root.per_process.is_empty());
     }
 }

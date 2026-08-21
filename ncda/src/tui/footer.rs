@@ -6,14 +6,29 @@ use ratatui::Frame;
 
 use crate::model::NodeStats;
 
+#[derive(Debug, Clone, Copy)]
+pub struct Diagnostics {
+    pub total_events: u64,
+    pub dropped_events: u64,
+    pub attribution_failures: u64,
+    pub failed_io_events: u64,
+    pub zero_byte_io_events: u64,
+}
+
 pub fn draw(
     f: &mut Frame,
     area: Rect,
     root_stats: &NodeStats,
     rate_bps: f64,
-    total_events: u64,
-    dropped_events: u64,
+    diagnostics: Diagnostics,
 ) {
+    let Diagnostics {
+        total_events,
+        dropped_events,
+        attribution_failures,
+        failed_io_events,
+        zero_byte_io_events,
+    } = diagnostics;
     let drop_style = Style::default().fg(if dropped_events == 0 {
         Color::DarkGray
     } else {
@@ -28,6 +43,22 @@ pub fn draw(
             Span::styled(" @", Style::default().fg(Color::Green)),
             Span::raw(format!("{}/s", format_bytes_raw(rate_bps as u64))),
             Span::styled(format!(" D:{}", format_count(dropped_events)), drop_style),
+            Span::styled(
+                format!(" A:{}", format_count(attribution_failures)),
+                Style::default().fg(if attribution_failures == 0 {
+                    Color::DarkGray
+                } else {
+                    Color::Yellow
+                }),
+            ),
+            Span::styled(
+                format!(" E:{}", format_count(failed_io_events)),
+                Style::default().fg(if failed_io_events == 0 {
+                    Color::DarkGray
+                } else {
+                    Color::Red
+                }),
+            ),
         ])
     } else {
         Line::from(vec![
@@ -45,6 +76,28 @@ pub fn draw(
             Span::raw(format!("Evts:{}", format_count(total_events))),
             Span::raw(" | "),
             Span::styled(format!("Drop:{}", format_count(dropped_events)), drop_style),
+            Span::raw(" | "),
+            Span::styled(
+                format!("Attr:{}", format_count(attribution_failures)),
+                Style::default().fg(if attribution_failures == 0 {
+                    Color::DarkGray
+                } else {
+                    Color::Yellow
+                }),
+            ),
+            Span::raw(" | "),
+            Span::styled(
+                format!(
+                    "Err:{} Zero:{}",
+                    format_count(failed_io_events),
+                    format_count(zero_byte_io_events)
+                ),
+                Style::default().fg(if failed_io_events == 0 {
+                    Color::DarkGray
+                } else {
+                    Color::Red
+                }),
+            ),
             if area.width >= 90 {
                 Span::raw(" | ")
             } else {

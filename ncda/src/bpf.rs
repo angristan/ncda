@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -29,6 +30,7 @@ pub enum BpfEvent {
         tid: u32,
         fd: u32,
         bytes: u64,
+        result: i64,
         latency_ns: u64,
         emitted_ns: u64,
     },
@@ -37,6 +39,7 @@ pub enum BpfEvent {
         tid: u32,
         fd: u32,
         bytes: u64,
+        result: i64,
         latency_ns: u64,
         emitted_ns: u64,
     },
@@ -264,7 +267,8 @@ fn parse_io_event(data: &[u8], kind: u32) -> Option<BpfEvent> {
     let pid = u32::from_ne_bytes(data[4..8].try_into().ok()?);
     let tid = u32::from_ne_bytes(data[8..12].try_into().ok()?);
     let fd = u32::from_ne_bytes(data[12..16].try_into().ok()?);
-    let bytes = u64::from_ne_bytes(data[16..24].try_into().ok()?);
+    let result = i64::from_ne_bytes(data[16..24].try_into().ok()?);
+    let bytes = result.max(0) as u64;
     let latency_ns = u64::from_ne_bytes(data[24..32].try_into().ok()?);
     let emitted_ns = u64::from_ne_bytes(data[32..40].try_into().ok()?);
 
@@ -274,6 +278,7 @@ fn parse_io_event(data: &[u8], kind: u32) -> Option<BpfEvent> {
             tid,
             fd,
             bytes,
+            result,
             latency_ns,
             emitted_ns,
         }),
@@ -282,6 +287,7 @@ fn parse_io_event(data: &[u8], kind: u32) -> Option<BpfEvent> {
             tid,
             fd,
             bytes,
+            result,
             latency_ns,
             emitted_ns,
         }),
@@ -352,6 +358,13 @@ pub struct FdPathCache {
     root_cache: HashMap<u32, Option<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathResolution {
+    Resolved(String),
+    Unresolved(String),
+    Ignored,
+}
+
 impl Default for FdPathCache {
     fn default() -> Self {
         Self::new()
@@ -366,16 +379,54 @@ impl FdPathCache {
         }
     }
 
-    /// Resolve the raw eBPF-captured path via procfs and return it.
-    /// Does **not** store the result — call [`store`] afterwards.
-    pub fn resolve(&mut self, pid: u32, fd: u32, dirfd: i32, raw_path: &str) -> String {
-        self.resolve_fd_path(pid, fd, dirfd, raw_path)
+    /// Resolve a newly opened descriptor without trusting a delayed procfs
+    /// target by itself. Relative candidates must still match the descriptor's
+    /// current target; otherwise activity is kept in the unresolved namespace.
+    pub fn resolve(&mut self, pid: u32, fd: u32, dirfd: i32, raw_path: &str) -> PathResolution {
+        match classify_pseudo_path(raw_path) {
+            PseudoPath::Ignore => return PathResolution::Ignored,
+            PseudoPath::Memory(path) => return PathResolution::Resolved(path),
+            PseudoPath::Ordinary => {}
+        }
+
+        if raw_path.starts_with('/') {
+            if matches!(
+                self.resolve_proc_target(pid, fd),
+                Some(PathResolution::Ignored)
+            ) {
+                return PathResolution::Ignored;
+            }
+            return PathResolution::Resolved(normalize_absolute_path(raw_path));
+        }
+
+        let base = if dirfd == libc::AT_FDCWD {
+            std::fs::read_link(format!("/proc/{pid}/cwd"))
+        } else {
+            std::fs::read_link(format!("/proc/{pid}/fd/{dirfd}"))
+        };
+        let Some(base) = base.ok().and_then(|path| path.to_str().map(str::to_string)) else {
+            return PathResolution::Unresolved(unresolved_path(pid, fd, raw_path));
+        };
+        let expected =
+            normalize_absolute_path(&self.strip_container_root(pid, &format!("{base}/{raw_path}")));
+
+        match self.resolve_proc_target(pid, fd) {
+            Some(PathResolution::Resolved(actual)) if actual == expected => {
+                PathResolution::Resolved(expected)
+            }
+            Some(PathResolution::Ignored) => PathResolution::Ignored,
+            Some(PathResolution::Resolved(path)) if path.starts_with("/[memory]/") => {
+                PathResolution::Resolved(path)
+            }
+            _ => PathResolution::Unresolved(unresolved_path(pid, fd, raw_path)),
+        }
     }
 
     /// Resolve an inherited or pre-existing descriptor on a cache miss.
-    pub fn resolve_existing(&mut self, pid: u32, fd: u32) -> Option<String> {
-        let path = self.resolve_fd_path(pid, fd, libc::AT_FDCWD, "");
-        (!path.is_empty()).then_some(path)
+    pub fn resolve_existing(&mut self, pid: u32, fd: u32) -> PathResolution {
+        self.resolve_proc_target(pid, fd).unwrap_or_else(|| {
+            PathResolution::Unresolved(format!("/[unresolved]/pid-{pid}/fd-{fd}"))
+        })
     }
 
     /// Store the final (possibly container-prefixed) path for a pid/fd.
@@ -409,69 +460,17 @@ impl FdPathCache {
         self.map.is_empty()
     }
 
-    /// Resolve the true file path for a given pid/fd via procfs.
-    /// Unresolved relative paths are kept in an explicit diagnostic namespace.
-    fn resolve_fd_path(&mut self, pid: u32, fd: u32, dirfd: i32, raw_path: &str) -> String {
-        // Try readlink on /proc/pid/fd/fd to get the kernel-resolved path.
-        // This works even for relative openat(dirfd, name, ...) calls
-        // because the kernel has already resolved the path.
-        if let Ok(resolved) = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
-            if let Some(s) = resolved.to_str() {
-                // The kernel appends " (deleted)" for unlinked-but-open files.
-                let s = s.trim_end_matches(" (deleted)");
-                match classify_pseudo_path(s) {
-                    PseudoPath::Ignore => return String::new(),
-                    PseudoPath::Memory(path) => return path,
-                    PseudoPath::Ordinary if s.starts_with('/') => {
-                        let path = self.strip_container_root(pid, s);
-                        return normalize_absolute_path(&path);
-                    }
-                    PseudoPath::Ordinary => {}
-                }
+    fn resolve_proc_target(&mut self, pid: u32, fd: u32) -> Option<PathResolution> {
+        let resolved = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
+        let path = resolved.to_str()?.trim_end_matches(" (deleted)");
+        match classify_pseudo_path(path) {
+            PseudoPath::Ignore => Some(PathResolution::Ignored),
+            PseudoPath::Memory(path) => Some(PathResolution::Resolved(path)),
+            PseudoPath::Ordinary if path.starts_with('/') => {
+                let path = self.strip_container_root(pid, path);
+                Some(PathResolution::Resolved(normalize_absolute_path(&path)))
             }
-        }
-
-        // A cache miss for inherited or pre-existing descriptors has no raw
-        // path. Never substitute the process cwd: it describes a directory,
-        // not the descriptor that performed the I/O.
-        if raw_path.is_empty() {
-            return String::new();
-        }
-
-        match classify_pseudo_path(raw_path) {
-            PseudoPath::Ignore => return String::new(),
-            PseudoPath::Memory(path) => return path,
-            PseudoPath::Ordinary => {}
-        }
-
-        // If the raw path is already absolute, normalize it before aggregation.
-        if raw_path.starts_with('/') {
-            return normalize_absolute_path(raw_path);
-        }
-
-        // For relative paths where /proc/pid/fd failed (fd already closed),
-        // resolve from cwd for AT_FDCWD or from the actual directory FD.
-        let base = if dirfd == libc::AT_FDCWD {
-            std::fs::read_link(format!("/proc/{pid}/cwd"))
-        } else {
-            std::fs::read_link(format!("/proc/{pid}/fd/{dirfd}"))
-        };
-        if let Ok(base) = base {
-            if let Some(base) = base.to_str() {
-                let full_path = format!("{base}/{raw_path}");
-                let path = self.strip_container_root(pid, &full_path);
-                return normalize_absolute_path(&path);
-            }
-        }
-
-        // The process or descriptor can disappear before userspace performs
-        // procfs resolution. Preserve that activity without presenting a raw
-        // basename as if it existed at the filesystem root.
-        let raw_path = normalize_relative_path(raw_path);
-        if raw_path.is_empty() {
-            format!("/[unresolved]/pid-{pid}")
-        } else {
-            format!("/[unresolved]/pid-{pid}/{raw_path}")
+            PseudoPath::Ordinary => None,
         }
     }
 
@@ -490,11 +489,11 @@ impl FdPathCache {
         });
 
         if let Some(root_str) = root {
-            if let Some(stripped) = host_path.strip_prefix(root_str.as_str()) {
-                return if stripped.is_empty() {
+            if let Ok(stripped) = Path::new(host_path).strip_prefix(Path::new(root_str)) {
+                return if stripped.as_os_str().is_empty() {
                     "/".to_string()
                 } else {
-                    stripped.to_string()
+                    format!("/{}", stripped.to_string_lossy())
                 };
             }
         }
@@ -526,6 +525,15 @@ fn classify_pseudo_path(path: &str) -> PseudoPath {
         return PseudoPath::Memory(format!("/[memory]/memfd:{name}"));
     }
     PseudoPath::Ordinary
+}
+
+fn unresolved_path(pid: u32, fd: u32, raw_path: &str) -> String {
+    let raw_path = normalize_relative_path(raw_path);
+    if raw_path.is_empty() {
+        format!("/[unresolved]/pid-{pid}/fd-{fd}")
+    } else {
+        format!("/[unresolved]/pid-{pid}/fd-{fd}/{raw_path}")
+    }
 }
 
 fn normalize_absolute_path(path: &str) -> String {
@@ -587,6 +595,30 @@ mod tests {
         let mut unknown = [0_u8; 32];
         unknown[0..4].copy_from_slice(&99_u32.to_ne_bytes());
         assert!(parse_event(&unknown).is_none());
+    }
+
+    #[test]
+    fn parser_preserves_failed_io_result_without_bytes() {
+        let mut event = [0_u8; 40];
+        event[0..4].copy_from_slice(&EVENT_READ.to_ne_bytes());
+        event[4..8].copy_from_slice(&7_u32.to_ne_bytes());
+        event[8..12].copy_from_slice(&8_u32.to_ne_bytes());
+        event[12..16].copy_from_slice(&9_u32.to_ne_bytes());
+        event[16..24].copy_from_slice(&(-libc::EIO as i64).to_ne_bytes());
+        event[24..32].copy_from_slice(&123_u64.to_ne_bytes());
+        event[32..40].copy_from_slice(&456_u64.to_ne_bytes());
+
+        assert!(matches!(
+            parse_event(&event),
+            Some(BpfEvent::Read {
+                pid: 7,
+                fd: 9,
+                bytes: 0,
+                result,
+                latency_ns: 123,
+                ..
+            }) if result == -(libc::EIO as i64)
+        ));
     }
 
     #[test]
@@ -685,14 +717,37 @@ mod tests {
     }
 
     #[test]
-    fn relative_fallback_uses_directory_fd() {
+    fn relative_path_requires_matching_open_descriptor() {
         use std::os::fd::AsRawFd;
 
-        let directory = std::fs::File::open("/tmp").unwrap();
+        let directory = std::fs::File::open("/dev").unwrap();
+        let file = std::fs::File::open("/dev/null").unwrap();
         let mut cache = FdPathCache::new();
-        let resolved = cache.resolve(std::process::id(), u32::MAX, directory.as_raw_fd(), "child");
+        let resolved = cache.resolve(
+            std::process::id(),
+            file.as_raw_fd() as u32,
+            directory.as_raw_fd(),
+            "null",
+        );
 
-        assert_eq!(resolved, "/tmp/child");
+        assert_eq!(resolved, PathResolution::Resolved("/dev/null".to_string()));
+    }
+
+    #[test]
+    fn delayed_relative_open_rejects_reused_descriptor_target() {
+        use std::os::fd::AsRawFd;
+
+        let directory = std::fs::File::open("/dev").unwrap();
+        let reused = std::fs::File::open("/dev/zero").unwrap();
+        let mut cache = FdPathCache::new();
+        let result = cache.resolve(
+            std::process::id(),
+            reused.as_raw_fd() as u32,
+            directory.as_raw_fd(),
+            "null",
+        );
+
+        assert!(matches!(result, PathResolution::Unresolved(path) if path.ends_with("/null")));
     }
 
     #[test]
@@ -700,7 +755,12 @@ mod tests {
         let mut cache = FdPathCache::new();
         let resolved = cache.resolve(u32::MAX, u32::MAX, libc::AT_FDCWD, "../../b006");
 
-        assert_eq!(resolved, "/[unresolved]/pid-4294967295/b006");
+        assert_eq!(
+            resolved,
+            PathResolution::Unresolved(
+                "/[unresolved]/pid-4294967295/fd-4294967295/b006".to_string()
+            )
+        );
     }
 
     #[test]
@@ -730,7 +790,14 @@ mod tests {
     fn missing_preexisting_descriptor_does_not_resolve_to_cwd() {
         let mut cache = FdPathCache::new();
 
-        assert_eq!(cache.resolve_existing(std::process::id(), u32::MAX), None);
+        assert_eq!(
+            cache.resolve_existing(std::process::id(), u32::MAX),
+            PathResolution::Unresolved(format!(
+                "/[unresolved]/pid-{}/fd-{}",
+                std::process::id(),
+                u32::MAX
+            ))
+        );
     }
 
     #[test]
@@ -753,10 +820,8 @@ mod tests {
 
         let file = std::fs::File::open("/dev/null").unwrap();
         let mut cache = FdPathCache::new();
-        let resolved = cache
-            .resolve_existing(std::process::id(), file.as_raw_fd() as u32)
-            .unwrap();
+        let resolved = cache.resolve_existing(std::process::id(), file.as_raw_fd() as u32);
 
-        assert_eq!(resolved, "/dev/null");
+        assert_eq!(resolved, PathResolution::Resolved("/dev/null".to_string()));
     }
 }

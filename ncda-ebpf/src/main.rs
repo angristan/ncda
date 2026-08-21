@@ -309,16 +309,13 @@ fn exit_open(pid_tgid: u64, result: i64, args: &OpenArgs) {
 #[inline(always)]
 fn exit_io(pid_tgid: u64, result: i64, args: &RwArgs) {
     record_io_exit(args.kind);
-    if result <= 0 {
-        return;
-    }
     let emitted_ns = unsafe { bpf_ktime_get_ns() };
     let event = IoEvent {
         kind: args.kind,
         pid: (pid_tgid >> 32) as u32,
         tid: pid_tgid as u32,
         fd: args.fd,
-        bytes: result as u64,
+        result,
         latency_ns: emitted_ns - args.ts,
         emitted_ns,
     };
@@ -338,7 +335,7 @@ fn exit_close(pid_tgid: u64, result: i64, fd: u32) {
         pid: (pid_tgid >> 32) as u32,
         tid: pid_tgid as u32,
         fd,
-        bytes: zero,
+        result: zero as i64,
         latency_ns: zero,
         emitted_ns: unsafe { bpf_ktime_get_ns() },
     };

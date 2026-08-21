@@ -361,8 +361,13 @@ fn draw(f: &mut ratatui::Frame, state: &AppState, view: &ViewState) {
         chunks[3],
         &state.tree.root.agg_stats,
         rate,
-        state.total_events,
-        state.dropped_events,
+        footer::Diagnostics {
+            total_events: state.total_events,
+            dropped_events: state.dropped_events,
+            attribution_failures: state.attribution_failures,
+            failed_io_events: state.failed_io_events,
+            zero_byte_io_events: state.zero_byte_io_events,
+        },
     );
 
     // Help overlay

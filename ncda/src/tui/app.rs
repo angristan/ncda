@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use crate::bpf::{BpfEvent, FdPathCache};
+use crate::bpf::{BpfEvent, FdPathCache, PathResolution};
 use crate::container::ContainerResolver;
 use crate::model::{FileTree, OpKind, SortBy};
 use crate::process::{ProcessSort, ProcessTable};
@@ -18,6 +18,12 @@ pub struct AppState {
     pub global_rate: RateTracker,
     pub total_events: u64,
     pub dropped_events: u64,
+    drop_total: u64,
+    drop_baseline: u64,
+    pub attribution_failures: u64,
+    pub ignored_non_file_events: u64,
+    pub failed_io_events: u64,
+    pub zero_byte_io_events: u64,
     /// Paths to exclude from tracking.
     pub exclude_prefixes: Vec<String>,
 }
@@ -33,6 +39,12 @@ impl AppState {
             global_rate: RateTracker::new(rate_window),
             total_events: 0,
             dropped_events: 0,
+            drop_total: 0,
+            drop_baseline: 0,
+            attribution_failures: 0,
+            ignored_non_file_events: 0,
+            failed_io_events: 0,
+            zero_byte_io_events: 0,
             exclude_prefixes,
         }
     }
@@ -50,23 +62,18 @@ impl AppState {
                     path,
                     emitted_ns: _,
                 } => {
-                    // Resolve the raw eBPF path via /proc/pid/fd/fd,
-                    // giving us the full absolute path even for relative
-                    // openat() calls and container processes.
-                    let mut resolved = self.fd_cache.resolve(pid, fd, dirfd, &path);
-                    if resolved.is_empty() {
-                        continue;
-                    }
-
-                    // Prefix with [container_name] for containerised processes
-                    // so they appear grouped in the tree.
-                    if let Some(name) = self.containers.resolve(pid) {
-                        if resolved.starts_with('/') {
-                            resolved = format!("/[{name}]{resolved}");
-                        } else {
-                            resolved = format!("/[{name}]/{resolved}");
+                    let resolved = match self.fd_cache.resolve(pid, fd, dirfd, &path) {
+                        PathResolution::Resolved(path) => path,
+                        PathResolution::Unresolved(path) => {
+                            self.attribution_failures += 1;
+                            path
                         }
-                    }
+                        PathResolution::Ignored => {
+                            self.ignored_non_file_events += 1;
+                            continue;
+                        }
+                    };
+                    let resolved = self.decorate_path(pid, resolved);
 
                     // Store the final path so Read/Write/Close reuse it.
                     self.fd_cache.store(pid, fd, resolved.clone());
@@ -82,9 +89,11 @@ impl AppState {
                     tid: _,
                     fd,
                     bytes,
+                    result,
                     latency_ns,
                     emitted_ns: _,
                 } => {
+                    self.record_io_outcome(result);
                     if let Some(path) = self.resolve_io_path(pid, fd) {
                         if self.is_excluded(&path) {
                             continue;
@@ -101,9 +110,11 @@ impl AppState {
                     tid: _,
                     fd,
                     bytes,
+                    result,
                     latency_ns,
                     emitted_ns: _,
                 } => {
+                    self.record_io_outcome(result);
                     if let Some(path) = self.resolve_io_path(pid, fd) {
                         if self.is_excluded(&path) {
                             continue;
@@ -170,6 +181,14 @@ impl AppState {
         }
     }
 
+    fn record_io_outcome(&mut self, result: i64) {
+        if result < 0 {
+            self.failed_io_events += 1;
+        } else if result == 0 {
+            self.zero_byte_io_events += 1;
+        }
+    }
+
     fn record_process(&mut self, pid: u32, op: OpKind, bytes: u64, latency_ns: u64) {
         let container = self.containers.resolve(pid).map(str::to_string);
         self.process_table
@@ -181,16 +200,28 @@ impl AppState {
             return Some(path.to_string());
         }
 
-        let mut resolved = self.fd_cache.resolve_existing(pid, fd)?;
-        if let Some(name) = self.containers.resolve(pid) {
-            if resolved.starts_with('/') {
-                resolved = format!("/[{name}]{resolved}");
-            } else {
-                resolved = format!("/[{name}]/{resolved}");
+        let resolved = match self.fd_cache.resolve_existing(pid, fd) {
+            PathResolution::Resolved(path) => path,
+            PathResolution::Unresolved(path) => {
+                self.attribution_failures += 1;
+                path
             }
-        }
+            PathResolution::Ignored => {
+                self.ignored_non_file_events += 1;
+                return None;
+            }
+        };
+        let resolved = self.decorate_path(pid, resolved);
         self.fd_cache.store(pid, fd, resolved.clone());
         Some(resolved)
+    }
+
+    fn decorate_path(&mut self, pid: u32, path: String) -> String {
+        if let Some(name) = self.containers.resolve(pid) {
+            format!("/[{name}]{path}")
+        } else {
+            path
+        }
     }
 
     fn is_excluded(&self, path: &str) -> bool {
@@ -199,13 +230,23 @@ impl AppState {
             .any(|prefix| path.starts_with(prefix))
     }
 
+    pub fn update_drop_total(&mut self, total: u64) {
+        self.drop_total = total;
+        self.dropped_events = total.saturating_sub(self.drop_baseline);
+    }
+
     pub fn reset(&mut self) {
         self.tree.reset();
         self.process_table.reset();
         self.event_log.reset();
         self.global_rate.reset();
         self.total_events = 0;
+        self.drop_baseline = self.drop_total;
         self.dropped_events = 0;
+        self.attribution_failures = 0;
+        self.ignored_non_file_events = 0;
+        self.failed_io_events = 0;
+        self.zero_byte_io_events = 0;
     }
 }
 
@@ -306,6 +347,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reset_uses_current_drop_total_as_baseline() {
+        let mut state = AppState::new(Duration::from_secs(5), Vec::new());
+        state.update_drop_total(7);
+        assert_eq!(state.dropped_events, 7);
+
+        state.reset();
+        assert_eq!(state.dropped_events, 0);
+        state.update_drop_total(9);
+        assert_eq!(state.dropped_events, 2);
+    }
+
+    #[test]
+    fn failed_and_zero_byte_io_are_counted_as_operations() {
+        let mut state = AppState::new(Duration::from_secs(5), Vec::new());
+        let pid = u32::MAX;
+        state.fd_cache.store(pid, 3, "/tmp/file".to_string());
+        state.ingest(vec![
+            BpfEvent::Read {
+                pid,
+                tid: pid,
+                fd: 3,
+                bytes: 0,
+                result: -(libc::EIO as i64),
+                latency_ns: 11,
+                emitted_ns: 1,
+            },
+            BpfEvent::Read {
+                pid,
+                tid: pid,
+                fd: 3,
+                bytes: 0,
+                result: 0,
+                latency_ns: 13,
+                emitted_ns: 2,
+            },
+        ]);
+
+        let file = &state.tree.root.children["tmp"].children["file"];
+        assert_eq!(file.stats.read_ops, 2);
+        assert_eq!(file.stats.read_bytes, 0);
+        assert_eq!(file.stats.avg_latency_ns(), 12);
+        assert_eq!(state.failed_io_events, 1);
+        assert_eq!(state.zero_byte_io_events, 1);
+    }
+
+    #[test]
     fn pseudo_descriptor_open_is_not_aggregated() {
         let mut state = AppState::new(Duration::from_secs(5), Vec::new());
         let pid = u32::MAX;
@@ -325,17 +412,22 @@ mod tests {
     #[test]
     fn dup_from_non_file_clears_existing_target() {
         let mut state = AppState::new(Duration::from_secs(5), Vec::new());
-        let pid = u32::MAX;
-        state.fd_cache.store(pid, 4, "/tmp/stale".to_string());
+        let pid = std::process::id();
+        let event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        assert!(event_fd >= 0);
+        state.fd_cache.store(pid, 1000, "/tmp/stale".to_string());
         state.ingest(vec![BpfEvent::Dup {
             pid,
             tid: pid,
-            old_fd: 3,
-            new_fd: 4,
+            old_fd: event_fd as u32,
+            new_fd: 1000,
             emitted_ns: 1,
         }]);
+        unsafe {
+            libc::close(event_fd);
+        }
 
-        assert_eq!(state.fd_cache.lookup(pid, 4), None);
+        assert_eq!(state.fd_cache.lookup(pid, 1000), None);
     }
 
     #[test]
@@ -380,6 +472,7 @@ mod tests {
                 tid: pid,
                 fd: 4,
                 bytes: 17,
+                result: 17,
                 latency_ns: 11,
                 emitted_ns: 3,
             },
