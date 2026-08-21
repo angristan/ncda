@@ -1,3 +1,10 @@
+## [1.0.2](https://github.com/angristan/ncda/compare/v1.0.1...v1.0.2) (2026-08-21)
+
+
+### Performance Improvements
+
+* coalesce repeated IO events ([762c7a7](https://github.com/angristan/ncda/commit/762c7a7522ce4223abba09a45f8c2ee626cabca1))
+
 ## [1.0.1](https://github.com/angristan/ncda/compare/v1.0.0...v1.0.1) (2026-08-21)
 
 
