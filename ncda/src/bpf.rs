@@ -356,11 +356,16 @@ impl FdPathCache {
         // because the kernel has already resolved the path.
         if let Ok(resolved) = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
             if let Some(s) = resolved.to_str() {
-                // The kernel appends " (deleted)" for unlinked-but-open files
+                // The kernel appends " (deleted)" for unlinked-but-open files.
                 let s = s.trim_end_matches(" (deleted)");
-                // Only use absolute paths; skip pipes, sockets, anon_inode, etc.
-                if s.starts_with('/') {
-                    return self.strip_container_root(pid, s);
+                match classify_pseudo_path(s) {
+                    PseudoPath::Ignore => return String::new(),
+                    PseudoPath::Memory(path) => return path,
+                    PseudoPath::Ordinary if s.starts_with('/') => {
+                        let path = self.strip_container_root(pid, s);
+                        return normalize_absolute_path(&path);
+                    }
+                    PseudoPath::Ordinary => {}
                 }
             }
         }
@@ -372,9 +377,15 @@ impl FdPathCache {
             return String::new();
         }
 
-        // If the raw path is already absolute, use it as-is
+        match classify_pseudo_path(raw_path) {
+            PseudoPath::Ignore => return String::new(),
+            PseudoPath::Memory(path) => return path,
+            PseudoPath::Ordinary => {}
+        }
+
+        // If the raw path is already absolute, normalize it before aggregation.
         if raw_path.starts_with('/') {
-            return raw_path.to_string();
+            return normalize_absolute_path(raw_path);
         }
 
         // For relative paths where /proc/pid/fd failed (fd already closed),
@@ -387,14 +398,20 @@ impl FdPathCache {
         if let Ok(base) = base {
             if let Some(base) = base.to_str() {
                 let full_path = format!("{base}/{raw_path}");
-                return self.strip_container_root(pid, &full_path);
+                let path = self.strip_container_root(pid, &full_path);
+                return normalize_absolute_path(&path);
             }
         }
 
         // The process or descriptor can disappear before userspace performs
         // procfs resolution. Preserve that activity without presenting a raw
         // basename as if it existed at the filesystem root.
-        format!("/[unresolved]/pid-{pid}/{raw_path}")
+        let raw_path = normalize_relative_path(raw_path);
+        if raw_path.is_empty() {
+            format!("/[unresolved]/pid-{pid}")
+        } else {
+            format!("/[unresolved]/pid-{pid}/{raw_path}")
+        }
     }
 
     /// Strip the container's root filesystem prefix from a host-side path.
@@ -423,6 +440,54 @@ impl FdPathCache {
 
         host_path.to_string()
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PseudoPath {
+    Ordinary,
+    Ignore,
+    Memory(String),
+}
+
+fn classify_pseudo_path(path: &str) -> PseudoPath {
+    let path = path.trim_end_matches(" (deleted)");
+    let target = path.strip_prefix('/').unwrap_or(path);
+    if target.starts_with("socket:")
+        || target.starts_with("pipe:")
+        || target.starts_with("anon_inode:")
+    {
+        return PseudoPath::Ignore;
+    }
+    if let Some(name) = target.strip_prefix("memfd:") {
+        // A memfd name may contain slashes, but it is one kernel object rather
+        // than a filesystem hierarchy. Keep it in one safe display component.
+        let name = name.replace('/', "∕");
+        return PseudoPath::Memory(format!("/[memory]/memfd:{name}"));
+    }
+    PseudoPath::Ordinary
+}
+
+fn normalize_absolute_path(path: &str) -> String {
+    let normalized = normalize_relative_path(path);
+    if normalized.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{normalized}")
+    }
+}
+
+fn normalize_relative_path(path: &str) -> String {
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            component => components.push(component),
+        }
+    }
+    components.join("/")
 }
 
 #[cfg(test)]
@@ -517,9 +582,32 @@ mod tests {
     #[test]
     fn unresolved_relative_paths_do_not_pollute_root() {
         let mut cache = FdPathCache::new();
-        let resolved = cache.resolve(u32::MAX, u32::MAX, libc::AT_FDCWD, "b006");
+        let resolved = cache.resolve(u32::MAX, u32::MAX, libc::AT_FDCWD, "../../b006");
 
         assert_eq!(resolved, "/[unresolved]/pid-4294967295/b006");
+    }
+
+    #[test]
+    fn pseudo_descriptors_are_filtered_or_grouped() {
+        assert_eq!(classify_pseudo_path("socket:[123]"), PseudoPath::Ignore);
+        assert_eq!(classify_pseudo_path("pipe:[123]"), PseudoPath::Ignore);
+        assert_eq!(
+            classify_pseudo_path("anon_inode:[eventfd]"),
+            PseudoPath::Ignore
+        );
+        assert_eq!(
+            classify_pseudo_path("/memfd:sd/executor-state (deleted)"),
+            PseudoPath::Memory("/[memory]/memfd:sd∕executor-state".to_string())
+        );
+    }
+
+    #[test]
+    fn filesystem_paths_are_lexically_normalized() {
+        assert_eq!(
+            normalize_absolute_path("/sys/devices/../bus/./pci"),
+            "/sys/bus/pci"
+        );
+        assert_eq!(normalize_absolute_path("/../../etc/hosts"), "/etc/hosts");
     }
 
     #[test]

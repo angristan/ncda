@@ -54,6 +54,9 @@ impl AppState {
                     // giving us the full absolute path even for relative
                     // openat() calls and container processes.
                     let mut resolved = self.fd_cache.resolve(pid, fd, dirfd, &path);
+                    if resolved.is_empty() {
+                        continue;
+                    }
 
                     // Prefix with [container_name] for containerised processes
                     // so they appear grouped in the tree.
@@ -276,6 +279,23 @@ impl ViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pseudo_descriptor_open_is_not_aggregated() {
+        let mut state = AppState::new(Duration::from_secs(5), Vec::new());
+        let pid = u32::MAX;
+        state.ingest(vec![BpfEvent::Open {
+            pid,
+            tid: pid,
+            fd: 3,
+            dirfd: libc::AT_FDCWD,
+            path: "socket:[123]".to_string(),
+            emitted_ns: 1,
+        }]);
+
+        assert!(state.tree.root.children.is_empty());
+        assert_eq!(state.fd_cache.lookup(pid, 3), None);
+    }
 
     #[test]
     fn duplicated_descriptor_keeps_path_attribution() {
