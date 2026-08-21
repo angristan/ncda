@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "ncda"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "aya",
@@ -896,14 +896,14 @@ dependencies = [
 
 [[package]]
 name = "ncda-common"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "ncda-ebpf"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aya-ebpf",
  "ncda-common",
