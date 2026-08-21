@@ -73,15 +73,14 @@ impl AppState {
                             continue;
                         }
                     };
-                    let resolved = self.decorate_path(pid, resolved);
-
-                    // Store the final path so Read/Write/Close reuse it.
+                    // Cache the process-visible path without display-only
+                    // container grouping so exclusions remain component-aware.
                     self.fd_cache.store(pid, fd, resolved.clone());
-
                     if self.is_excluded(&resolved) {
                         continue;
                     }
-                    self.tree.record(&resolved, pid, OpKind::Open, 0, 0);
+                    let display_path = self.decorate_path(pid, resolved);
+                    self.tree.record(&display_path, pid, OpKind::Open, 0, 0);
                     self.record_process(pid, OpKind::Open, 0, 0);
                 }
                 BpfEvent::Read {
@@ -94,10 +93,11 @@ impl AppState {
                     emitted_ns: _,
                 } => {
                     self.record_io_outcome(result);
-                    if let Some(path) = self.resolve_io_path(pid, fd) {
+                    if let Some(path) = self.resolve_fd_path(pid, fd) {
                         if self.is_excluded(&path) {
                             continue;
                         }
+                        let path = self.decorate_path(pid, path);
                         self.tree
                             .record(&path, pid, OpKind::Read, bytes, latency_ns);
                         self.record_process(pid, OpKind::Read, bytes, latency_ns);
@@ -115,10 +115,11 @@ impl AppState {
                     emitted_ns: _,
                 } => {
                     self.record_io_outcome(result);
-                    if let Some(path) = self.resolve_io_path(pid, fd) {
+                    if let Some(path) = self.resolve_fd_path(pid, fd) {
                         if self.is_excluded(&path) {
                             continue;
                         }
+                        let path = self.decorate_path(pid, path);
                         self.tree
                             .record(&path, pid, OpKind::Write, bytes, latency_ns);
                         self.record_process(pid, OpKind::Write, bytes, latency_ns);
@@ -132,9 +133,9 @@ impl AppState {
                     fd,
                     emitted_ns: _,
                 } => {
-                    if let Some(path) = self.fd_cache.lookup(pid, fd) {
-                        let path = path.to_string();
+                    if let Some(path) = self.fd_cache.lookup(pid, fd).map(str::to_string) {
                         if !self.is_excluded(&path) {
+                            let path = self.decorate_path(pid, path);
                             self.tree.record(&path, pid, OpKind::Close, 0, 0);
                             self.record_process(pid, OpKind::Close, 0, 0);
                         }
@@ -148,7 +149,7 @@ impl AppState {
                     new_fd,
                     emitted_ns: _,
                 } => {
-                    let source_path = self.resolve_io_path(pid, old_fd);
+                    let source_path = self.resolve_fd_path(pid, old_fd);
                     if old_fd != new_fd {
                         // dup2/dup3 atomically close an existing target. Clear
                         // it even when the source is a non-file descriptor.
@@ -195,7 +196,7 @@ impl AppState {
             .record_with_context(pid, container.as_deref(), op, bytes, latency_ns);
     }
 
-    fn resolve_io_path(&mut self, pid: u32, fd: u32) -> Option<String> {
+    fn resolve_fd_path(&mut self, pid: u32, fd: u32) -> Option<String> {
         if let Some(path) = self.fd_cache.lookup(pid, fd) {
             return Some(path.to_string());
         }
@@ -211,7 +212,6 @@ impl AppState {
                 return None;
             }
         };
-        let resolved = self.decorate_path(pid, resolved);
         self.fd_cache.store(pid, fd, resolved.clone());
         Some(resolved)
     }
@@ -225,9 +225,13 @@ impl AppState {
     }
 
     fn is_excluded(&self, path: &str) -> bool {
-        self.exclude_prefixes
-            .iter()
-            .any(|prefix| path.starts_with(prefix))
+        self.exclude_prefixes.iter().any(|prefix| {
+            let prefix = prefix.trim_end_matches('/');
+            path == prefix
+                || path
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
     }
 
     pub fn update_drop_total(&mut self, total: u64) {
@@ -345,6 +349,15 @@ impl ViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exclusions_match_complete_path_components() {
+        let state = AppState::new(Duration::from_secs(5), vec!["/proc".to_string()]);
+
+        assert!(state.is_excluded("/proc"));
+        assert!(state.is_excluded("/proc/123/status"));
+        assert!(!state.is_excluded("/procfoo/status"));
+    }
 
     #[test]
     fn reset_uses_current_drop_total_as_baseline() {

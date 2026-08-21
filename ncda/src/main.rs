@@ -10,6 +10,7 @@ use log::{debug, info, warn};
 use tokio::sync::{mpsc, watch};
 
 use ncda::bpf::{self, BpfEvent, ReaderDropCounters};
+use ncda::container::{ContainerResolver, REDISCOVERY_INTERVAL};
 use ncda::tui::app::AppState;
 use ncda::{model, tui};
 
@@ -88,6 +89,11 @@ async fn main() -> Result<()> {
     // Shared application state
     let rate_window = Duration::from_secs(cli.rate_window);
     let state = Arc::new(Mutex::new(AppState::new(rate_window, cli.exclude)));
+    let (container_shutdown_tx, container_shutdown_rx) = watch::channel(false);
+    let container_handle = tokio::spawn(monitor_container_discovery(
+        state.clone(),
+        container_shutdown_rx,
+    ));
 
     // Channel: BPF reader → aggregator.
     let (tx, mut rx) = mpsc::channel::<Vec<BpfEvent>>(512);
@@ -124,13 +130,19 @@ async fn main() -> Result<()> {
         run_tui_mode(state.clone())
     };
 
-    // Detach first, then drain the ring and aggregate every queued batch.
+    // Stop enrichment and detach producers, then drain and aggregate every
+    // event already queued in the kernel and userspace.
+    let _ = container_shutdown_tx.send(true);
     drop(ebpf);
     let _ = reader_shutdown_tx.send(true);
     reader_handle.await.context("BPF reader task panicked")??;
     aggregator_handle
         .await
         .context("aggregator task panicked")?;
+
+    container_handle
+        .await
+        .context("container discovery task panicked")??;
 
     let _ = stats_shutdown_tx.send(true);
     let final_drops = stats_handle
@@ -167,6 +179,34 @@ impl DropSnapshot {
             + self.scratch_failures
             + self.parse_drops
             + self.queue_drops
+    }
+}
+
+async fn monitor_container_discovery(
+    state: Arc<Mutex<AppState>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let discovered = tokio::task::spawn_blocking(ContainerResolver::discover_blocking)
+            .await
+            .context("container discovery worker panicked")?;
+        state
+            .lock()
+            .unwrap()
+            .containers
+            .replace_discovery(discovered);
+
+        tokio::select! {
+            _ = tokio::time::sleep(REDISCOVERY_INTERVAL) => {}
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+        }
     }
 }
 

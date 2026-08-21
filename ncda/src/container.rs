@@ -14,10 +14,12 @@
 //! Re-discovery happens every 30 s to pick up new containers.
 
 use std::collections::HashMap;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
-const REDISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
+pub const REDISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Resolves PIDs to container display names.
 pub struct ContainerResolver {
@@ -27,8 +29,6 @@ pub struct ContainerResolver {
     sandbox_names: HashMap<String, String>,
     /// pid → resolved name (None = not in a container).
     pid_cache: HashMap<u32, Option<String>>,
-    /// When the last discovery happened.
-    last_discovery: Instant,
 }
 
 impl Default for ContainerResolver {
@@ -39,24 +39,31 @@ impl Default for ContainerResolver {
 
 impl ContainerResolver {
     pub fn new() -> Self {
-        let mut r = Self {
+        Self {
             container_names: HashMap::new(),
             sandbox_names: HashMap::new(),
             pid_cache: HashMap::new(),
-            last_discovery: Instant::now(),
-        };
-        r.discover();
-        r
+        }
+    }
+
+    /// Run external discovery off the ingestion thread.
+    pub fn discover_blocking() -> Self {
+        let mut resolver = Self::new();
+        if !resolver.discover_crictl() {
+            resolver.discover_docker();
+        }
+        resolver
+    }
+
+    pub fn replace_discovery(&mut self, discovered: Self) {
+        self.container_names = discovered.container_names;
+        self.sandbox_names = discovered.sandbox_names;
+        self.pid_cache.clear();
     }
 
     /// Return the container display name for `pid`, or `None` if the
     /// process does not belong to a known container.
     pub fn resolve(&mut self, pid: u32) -> Option<&str> {
-        if self.last_discovery.elapsed() > REDISCOVERY_INTERVAL {
-            self.discover();
-            self.pid_cache.clear();
-        }
-
         if !self.pid_cache.contains_key(&pid) {
             let name = self.lookup_pid(pid);
             self.pid_cache.insert(pid, name);
@@ -71,56 +78,51 @@ impl ContainerResolver {
 
     fn lookup_pid(&self, pid: u32) -> Option<String> {
         let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-        let line = cgroup.lines().next()?;
+        for line in cgroup.lines() {
+            // Extract the cgroup path (everything after hierarchy-id:controller:).
+            let path = line.splitn(3, ':').nth(2).unwrap_or("");
 
-        // Extract the cgroup path (everything after hierarchy-id:controller:).
-        let path = line.splitn(3, ':').nth(2).unwrap_or("");
-
-        // --- Format A: .../cri-containerd-<ID>.scope  (or docker-/libpod-) ---
-        if let Some(id) = extract_scope_id(path) {
-            if let Some(name) = self.container_names.get(&id) {
-                return Some(name.clone());
+            // Format A: .../cri-containerd-<ID>.scope (or docker-/libpod-).
+            if let Some(id) = extract_scope_id(path) {
+                return Some(
+                    self.container_names
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| id[..12.min(id.len())].to_string()),
+                );
             }
-            // Unknown container ID – use short ID.
-            return Some(id[..12.min(id.len())].to_string());
-        }
 
-        // --- Format B: ...:cri-containerd:<sandbox_id> ---
-        if let Some(id) = extract_colon_id(line) {
-            if let Some(name) = self.sandbox_names.get(&id) {
-                return Some(name.clone());
+            // Format B: ...:cri-containerd:<sandbox_id>.
+            if let Some(id) = extract_colon_id(line) {
+                return Some(
+                    self.sandbox_names
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| id[..12.min(id.len())].to_string()),
+                );
             }
-            // Unknown sandbox – use short ID.
-            return Some(id[..12.min(id.len())].to_string());
-        }
 
-        // --- Generic: any /docker/<ID> or /kubepods/…/<ID> ---
-        if let Some(id) = extract_path_id(path) {
-            if let Some(name) = self.container_names.get(&id) {
-                return Some(name.clone());
+            // Generic: any /docker/<ID> or /kubepods/…/<ID>.
+            if let Some(id) = extract_path_id(path) {
+                return Some(
+                    self.container_names
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| id[..12.min(id.len())].to_string()),
+                );
             }
-            return Some(id[..12.min(id.len())].to_string());
         }
 
         None
     }
 
-    fn discover(&mut self) {
-        self.container_names.clear();
-        self.sandbox_names.clear();
-
-        if self.discover_crictl() {
-            self.last_discovery = Instant::now();
-            return;
-        }
-        self.discover_docker();
-        self.last_discovery = Instant::now();
-    }
-
-    /// Discover via `crictl ps -o json`.  Returns true on success.
+    /// Discover via `crictl ps -o json`. Returns true on success.
     fn discover_crictl(&mut self) -> bool {
-        let output = match Command::new("crictl").args(["ps", "-o", "json"]).output() {
-            Ok(o) if o.status.success() => o,
+        let output = match command_output(
+            Command::new("crictl").args(["ps", "-o", "json"]),
+            COMMAND_TIMEOUT,
+        ) {
+            Some(output) if output.status.success() => output,
             _ => return false,
         };
 
@@ -160,11 +162,11 @@ impl ContainerResolver {
 
     /// Discover via `docker ps`.
     fn discover_docker(&mut self) {
-        let output = match Command::new("docker")
-            .args(["ps", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}"])
-            .output()
-        {
-            Ok(o) if o.status.success() => o,
+        let output = match command_output(
+            Command::new("docker").args(["ps", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}"]),
+            COMMAND_TIMEOUT,
+        ) {
+            Some(output) if output.status.success() => output,
             _ => return,
         };
 
@@ -185,6 +187,23 @@ impl ContainerResolver {
             };
             self.container_names
                 .insert(id.to_string(), name.to_string());
+        }
+    }
+}
+
+fn command_output(command: &mut Command, timeout: Duration) -> Option<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
     }
 }
