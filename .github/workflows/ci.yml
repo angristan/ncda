@@ -29,6 +29,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          persist-credentials: false
 
       - name: Install userspace Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -55,7 +57,15 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --locked --bins
 
-      # GitHub-hosted runners are disposable VMs. This never runs on
-      # pull_request_target and receives no repository secrets.
+      - name: Smoke test release CLIs
+        run: |
+          ./target/release/ncda --help
+          ./target/release/ncda --version
+          ./target/release/ncda-bench --help
+          ./target/release/ncda-bench --version
+
+      # Never run pull-request-controlled code with root privileges. Native
+      # live capture still runs for trusted main pushes and manual dispatches.
       - name: Run live eBPF integration suite
+        if: github.event_name != 'pull_request'
         run: scripts/test-ebpf.sh
