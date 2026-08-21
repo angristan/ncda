@@ -51,7 +51,7 @@ impl RateTracker {
         *self.state.get_mut() = RateState::default();
     }
 
-    fn record_at(&mut self, now: Instant, bytes: u64) {
+    pub(crate) fn record_at(&mut self, now: Instant, bytes: u64) {
         let state = self.state.get_mut();
         expire_rate_buckets(state, now, self.window);
         if self.window.is_zero() || bytes == 0 {
@@ -163,7 +163,7 @@ impl EventLog {
         *self.state.get_mut() = EventState::default();
     }
 
-    fn record_at(&mut self, now: Instant, path: String, pid: u32, bytes: u64) {
+    pub(crate) fn record_at(&mut self, now: Instant, path: String, pid: u32, bytes: u64) {
         let state = self.state.get_mut();
         expire_event_buckets(state, now, self.window);
         if self.window.is_zero() || bytes == 0 {

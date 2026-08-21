@@ -1,12 +1,77 @@
-use std::collections::HashSet;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::bpf::{BpfEvent, FdPathCache, PathResolution};
 use crate::container::ContainerResolver;
-use crate::model::{FileTree, OpKind, SortBy};
+use crate::model::{FileTree, NodeStats, OpKind, SortBy};
 use crate::process::{ProcessSort, ProcessTable};
 use crate::rate::{EventLog, RateTracker};
 use crate::tui::filter::FilterQuery;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct IoKey {
+    pid: u32,
+    fd: u32,
+    op: OpKind,
+}
+
+struct IoGroup {
+    key: IoKey,
+    bytes: u64,
+    operations: u64,
+    total_latency_ns: u64,
+    max_latency_ns: u64,
+    observed_at: Instant,
+}
+
+impl IoGroup {
+    fn new(key: IoKey, bytes: u64, latency_ns: u64, observed_at: Instant) -> Self {
+        Self {
+            key,
+            bytes,
+            operations: 1,
+            total_latency_ns: latency_ns,
+            max_latency_ns: latency_ns,
+            observed_at,
+        }
+    }
+
+    fn record(&mut self, bytes: u64, latency_ns: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.operations = self.operations.saturating_add(1);
+        self.total_latency_ns = self.total_latency_ns.saturating_add(latency_ns);
+        self.max_latency_ns = self.max_latency_ns.max(latency_ns);
+    }
+
+    fn stats(&self) -> NodeStats {
+        NodeStats::for_operations(
+            self.key.op,
+            self.bytes,
+            self.operations,
+            self.total_latency_ns,
+            self.max_latency_ns,
+        )
+    }
+}
+
+fn accumulate_io_group(
+    groups: &mut Vec<Option<IoGroup>>,
+    positions: &mut HashMap<IoKey, usize>,
+    key: IoKey,
+    bytes: u64,
+    latency_ns: u64,
+    observed_at: Instant,
+) {
+    if let Some(index) = positions.get(&key).copied() {
+        groups[index]
+            .as_mut()
+            .expect("indexed I/O group must remain active")
+            .record(bytes, latency_ns);
+    } else {
+        positions.insert(key, groups.len());
+        groups.push(Some(IoGroup::new(key, bytes, latency_ns, observed_at)));
+    }
+}
 
 /// Shared state updated by the aggregator task, read by the TUI.
 pub struct AppState {
@@ -51,140 +116,261 @@ impl AppState {
 
     /// Ingest a batch of BPF events into the state.
     pub fn ingest(&mut self, events: Vec<BpfEvent>) {
+        self.total_events = self
+            .total_events
+            .saturating_add(u64::try_from(events.len()).unwrap_or(u64::MAX));
+
+        // Preserve every lifecycle boundary, but combine successful I/O for
+        // the same descriptor between boundaries. First-seen key order keeps
+        // procfs resolution deterministic while avoiding per-event tree work.
+        let observed_at = Instant::now();
+        let mut groups = Vec::<Option<IoGroup>>::new();
+        let mut positions = HashMap::<IoKey, usize>::new();
         for event in events {
-            self.total_events = self.total_events.saturating_add(1);
             match event {
-                BpfEvent::Open {
-                    pid,
-                    tid: _,
-                    fd,
-                    dirfd,
-                    path,
-                    emitted_ns: _,
-                } => {
-                    let resolved = match self.fd_cache.resolve(pid, fd, dirfd, &path) {
-                        PathResolution::Resolved(path) => path,
-                        PathResolution::Unresolved(path) => {
-                            self.attribution_failures = self.attribution_failures.saturating_add(1);
-                            path
-                        }
-                        PathResolution::Ignored => {
-                            self.ignored_non_file_events =
-                                self.ignored_non_file_events.saturating_add(1);
-                            continue;
-                        }
-                    };
-                    // Cache the process-visible path without display-only
-                    // container grouping so exclusions remain component-aware.
-                    self.fd_cache.store(pid, fd, resolved.clone());
-                    if self.is_excluded(&resolved) {
-                        continue;
-                    }
-                    let display_path = self.decorate_path(pid, resolved);
-                    self.tree.record(&display_path, pid, OpKind::Open, 0, 0);
-                    self.record_process(pid, OpKind::Open, 0, 0);
-                }
                 BpfEvent::Read {
                     pid,
-                    tid: _,
                     fd,
                     bytes,
                     result,
                     latency_ns,
-                    emitted_ns: _,
+                    ..
                 } => {
                     self.record_io_outcome(result);
-                    if result <= 0 {
-                        continue;
-                    }
-                    if let Some(path) = self.resolve_fd_path(pid, fd) {
-                        if self.is_excluded(&path) {
-                            continue;
-                        }
-                        let path = self.decorate_path(pid, path);
-                        self.tree
-                            .record(&path, pid, OpKind::Read, bytes, latency_ns);
-                        self.record_process(pid, OpKind::Read, bytes, latency_ns);
-                        self.global_rate.record(bytes);
-                        self.event_log.record(path, pid, bytes);
+                    if result > 0 {
+                        accumulate_io_group(
+                            &mut groups,
+                            &mut positions,
+                            IoKey {
+                                pid,
+                                fd,
+                                op: OpKind::Read,
+                            },
+                            bytes,
+                            latency_ns,
+                            observed_at,
+                        );
                     }
                 }
                 BpfEvent::Write {
                     pid,
-                    tid: _,
                     fd,
                     bytes,
                     result,
                     latency_ns,
-                    emitted_ns: _,
+                    ..
                 } => {
                     self.record_io_outcome(result);
-                    if result <= 0 {
-                        continue;
+                    if result > 0 {
+                        accumulate_io_group(
+                            &mut groups,
+                            &mut positions,
+                            IoKey {
+                                pid,
+                                fd,
+                                op: OpKind::Write,
+                            },
+                            bytes,
+                            latency_ns,
+                            observed_at,
+                        );
                     }
-                    if let Some(path) = self.resolve_fd_path(pid, fd) {
-                        if self.is_excluded(&path) {
-                            continue;
-                        }
+                }
+                lifecycle => {
+                    self.flush_lifecycle_groups(&lifecycle, &mut groups, &mut positions);
+                    self.ingest_lifecycle(lifecycle);
+                }
+            }
+        }
+        self.flush_io_groups(&mut groups, &mut positions);
+    }
+
+    fn flush_io_groups(
+        &mut self,
+        groups: &mut Vec<Option<IoGroup>>,
+        positions: &mut HashMap<IoKey, usize>,
+    ) {
+        positions.clear();
+        for group in groups.drain(..).flatten() {
+            self.record_io_group(group);
+        }
+    }
+
+    fn flush_lifecycle_groups(
+        &mut self,
+        event: &BpfEvent,
+        groups: &mut [Option<IoGroup>],
+        positions: &mut HashMap<IoKey, usize>,
+    ) {
+        match event {
+            BpfEvent::Open { pid, fd, .. } | BpfEvent::Close { pid, fd, .. } => {
+                self.flush_fd_groups(*pid, *fd, groups, positions);
+            }
+            BpfEvent::Dup {
+                pid,
+                old_fd,
+                new_fd,
+                ..
+            } => {
+                self.flush_fd_groups(*pid, *old_fd, groups, positions);
+                if old_fd != new_fd {
+                    self.flush_fd_groups(*pid, *new_fd, groups, positions);
+                }
+            }
+            BpfEvent::CloseRange {
+                pid,
+                first_fd,
+                last_fd,
+                ..
+            } => {
+                let keys: Vec<_> = positions
+                    .keys()
+                    .copied()
+                    .filter(|key| key.pid == *pid && key.fd >= *first_fd && key.fd <= *last_fd)
+                    .collect();
+                for key in keys {
+                    self.flush_io_key(key, groups, positions);
+                }
+            }
+            BpfEvent::ProcessExec { pid, .. } | BpfEvent::ProcessExit { pid, .. } => {
+                let keys: Vec<_> = positions
+                    .keys()
+                    .copied()
+                    .filter(|key| key.pid == *pid)
+                    .collect();
+                for key in keys {
+                    self.flush_io_key(key, groups, positions);
+                }
+            }
+            BpfEvent::Read { .. } | BpfEvent::Write { .. } => {
+                unreachable!("I/O events do not create lifecycle barriers")
+            }
+        }
+    }
+
+    fn flush_fd_groups(
+        &mut self,
+        pid: u32,
+        fd: u32,
+        groups: &mut [Option<IoGroup>],
+        positions: &mut HashMap<IoKey, usize>,
+    ) {
+        for op in [OpKind::Read, OpKind::Write] {
+            self.flush_io_key(IoKey { pid, fd, op }, groups, positions);
+        }
+    }
+
+    fn flush_io_key(
+        &mut self,
+        key: IoKey,
+        groups: &mut [Option<IoGroup>],
+        positions: &mut HashMap<IoKey, usize>,
+    ) {
+        if let Some(index) = positions.remove(&key) {
+            let group = groups[index]
+                .take()
+                .expect("indexed I/O group must remain active");
+            self.record_io_group(group);
+        }
+    }
+
+    fn record_io_group(&mut self, group: IoGroup) {
+        let Some(path) = self.resolve_fd_path(group.key.pid, group.key.fd) else {
+            // Ignored pseudo descriptors are intentionally not cached, so the
+            // uncoalesced path would count each event as ignored.
+            self.ignored_non_file_events = self
+                .ignored_non_file_events
+                .saturating_add(group.operations.saturating_sub(1));
+            return;
+        };
+        if self.is_excluded(&path) {
+            return;
+        }
+
+        let container = self.containers.resolve(group.key.pid).map(str::to_string);
+        let display_path = if let Some(name) = container.as_deref() {
+            format!("/[{name}]{path}")
+        } else {
+            path
+        };
+        let stats = group.stats();
+        self.tree.record_stats(&display_path, group.key.pid, &stats);
+        self.process_table
+            .record_stats_with_context(group.key.pid, container.as_deref(), &stats);
+        self.global_rate.record_at(group.observed_at, group.bytes);
+        self.event_log
+            .record_at(group.observed_at, display_path, group.key.pid, group.bytes);
+    }
+
+    fn ingest_lifecycle(&mut self, event: BpfEvent) {
+        match event {
+            BpfEvent::Open {
+                pid,
+                fd,
+                dirfd,
+                path,
+                ..
+            } => {
+                let resolved = match self.fd_cache.resolve(pid, fd, dirfd, &path) {
+                    PathResolution::Resolved(path) => path,
+                    PathResolution::Unresolved(path) => {
+                        self.attribution_failures = self.attribution_failures.saturating_add(1);
+                        path
+                    }
+                    PathResolution::Ignored => {
+                        self.ignored_non_file_events =
+                            self.ignored_non_file_events.saturating_add(1);
+                        return;
+                    }
+                };
+                self.fd_cache.store(pid, fd, resolved.clone());
+                if self.is_excluded(&resolved) {
+                    return;
+                }
+                let display_path = self.decorate_path(pid, resolved);
+                self.tree.record(&display_path, pid, OpKind::Open, 0, 0);
+                self.record_process(pid, OpKind::Open, 0, 0);
+            }
+            BpfEvent::Close { pid, fd, .. } => {
+                if let Some(path) = self.fd_cache.lookup(pid, fd).map(str::to_string) {
+                    if !self.is_excluded(&path) {
                         let path = self.decorate_path(pid, path);
-                        self.tree
-                            .record(&path, pid, OpKind::Write, bytes, latency_ns);
-                        self.record_process(pid, OpKind::Write, bytes, latency_ns);
-                        self.global_rate.record(bytes);
-                        self.event_log.record(path, pid, bytes);
+                        self.tree.record(&path, pid, OpKind::Close, 0, 0);
+                        self.record_process(pid, OpKind::Close, 0, 0);
                     }
                 }
-                BpfEvent::Close {
-                    pid,
-                    tid: _,
-                    fd,
-                    emitted_ns: _,
-                } => {
-                    if let Some(path) = self.fd_cache.lookup(pid, fd).map(str::to_string) {
-                        if !self.is_excluded(&path) {
-                            let path = self.decorate_path(pid, path);
-                            self.tree.record(&path, pid, OpKind::Close, 0, 0);
-                            self.record_process(pid, OpKind::Close, 0, 0);
-                        }
-                    }
-                    self.fd_cache.on_close(pid, fd);
+                self.fd_cache.on_close(pid, fd);
+            }
+            BpfEvent::Dup {
+                pid,
+                old_fd,
+                new_fd,
+                ..
+            } => {
+                let source_path = self.resolve_fd_path(pid, old_fd);
+                if old_fd != new_fd {
+                    self.fd_cache.on_close(pid, new_fd);
                 }
-                BpfEvent::Dup {
-                    pid,
-                    tid: _,
-                    old_fd,
-                    new_fd,
-                    emitted_ns: _,
-                } => {
-                    let source_path = self.resolve_fd_path(pid, old_fd);
-                    if old_fd != new_fd {
-                        // dup2/dup3 atomically close an existing target. Clear
-                        // it even when the source is a non-file descriptor.
-                        self.fd_cache.on_close(pid, new_fd);
-                    }
-                    if let Some(path) = source_path {
-                        self.fd_cache.store(pid, new_fd, path);
-                    }
+                if let Some(path) = source_path {
+                    self.fd_cache.store(pid, new_fd, path);
                 }
-                BpfEvent::CloseRange {
-                    pid,
-                    tid: _,
-                    first_fd,
-                    last_fd,
-                    flags: _,
-                    emitted_ns: _,
-                } => {
-                    // Invalidating CLOSE_RANGE_CLOEXEC entries early is safe:
-                    // surviving files are re-resolved on their next I/O.
-                    self.fd_cache.on_close_range(pid, first_fd, last_fd);
-                }
-                BpfEvent::ProcessExec { pid, emitted_ns: _ }
-                | BpfEvent::ProcessExit { pid, emitted_ns: _ } => {
-                    self.fd_cache.on_process_reset(pid);
-                    self.containers.invalidate_pid(pid);
-                    self.process_table.remove(pid);
-                    self.tree.remove_process(pid);
-                }
+            }
+            BpfEvent::CloseRange {
+                pid,
+                first_fd,
+                last_fd,
+                ..
+            } => {
+                self.fd_cache.on_close_range(pid, first_fd, last_fd);
+            }
+            BpfEvent::ProcessExec { pid, .. } | BpfEvent::ProcessExit { pid, .. } => {
+                self.fd_cache.on_process_reset(pid);
+                self.containers.invalidate_pid(pid);
+                self.process_table.remove(pid);
+                self.tree.remove_process(pid);
+            }
+            BpfEvent::Read { .. } | BpfEvent::Write { .. } => {
+                unreachable!("I/O events are accumulated before lifecycle processing")
             }
         }
     }
@@ -358,6 +544,224 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repeated_io_collapses_to_one_ordered_group() {
+        let key = IoKey {
+            pid: 7,
+            fd: 3,
+            op: OpKind::Read,
+        };
+        let mut groups = Vec::new();
+        let mut positions = HashMap::new();
+        let observed_at = Instant::now();
+        for latency in 1..=4_096 {
+            accumulate_io_group(
+                &mut groups,
+                &mut positions,
+                key,
+                4_096,
+                latency,
+                observed_at,
+            );
+        }
+
+        assert_eq!(groups.len(), 1);
+        let group = groups[0].as_ref().unwrap();
+        assert_eq!(group.operations, 4_096);
+        assert_eq!(group.bytes, 4_096 * 4_096);
+        assert_eq!(group.total_latency_ns, (1..=4_096).sum());
+        assert_eq!(group.max_latency_ns, 4_096);
+    }
+
+    #[test]
+    fn unrelated_lifecycle_does_not_split_io_groups() {
+        let key = IoKey {
+            pid: 7,
+            fd: 3,
+            op: OpKind::Read,
+        };
+        let mut groups = Vec::new();
+        let mut positions = HashMap::new();
+        let mut state = AppState::new(Duration::from_secs(5), Vec::new());
+        let observed_at = Instant::now();
+        accumulate_io_group(&mut groups, &mut positions, key, 4_096, 10, observed_at);
+        state.flush_lifecycle_groups(
+            &BpfEvent::Close {
+                pid: 8,
+                tid: 8,
+                fd: 3,
+                emitted_ns: 1,
+            },
+            &mut groups,
+            &mut positions,
+        );
+        accumulate_io_group(&mut groups, &mut positions, key, 4_096, 20, observed_at);
+
+        assert_eq!(positions.len(), 1);
+        assert_eq!(groups.iter().flatten().count(), 1);
+        assert_eq!(groups[0].as_ref().unwrap().operations, 2);
+    }
+
+    #[test]
+    fn coalescing_matches_single_event_ingestion_across_fd_replacement() {
+        let pid = u32::MAX;
+        let events = vec![
+            BpfEvent::Read {
+                pid,
+                tid: pid,
+                fd: 3,
+                bytes: 10,
+                result: 10,
+                latency_ns: 100,
+                emitted_ns: 1,
+            },
+            BpfEvent::Read {
+                pid,
+                tid: pid,
+                fd: 3,
+                bytes: 5,
+                result: 5,
+                latency_ns: 50,
+                emitted_ns: 2,
+            },
+            BpfEvent::Write {
+                pid,
+                tid: pid,
+                fd: 3,
+                bytes: 20,
+                result: 20,
+                latency_ns: 200,
+                emitted_ns: 3,
+            },
+            BpfEvent::Read {
+                pid,
+                tid: pid,
+                fd: 3,
+                bytes: 0,
+                result: -(libc::EIO as i64),
+                latency_ns: 10,
+                emitted_ns: 4,
+            },
+            BpfEvent::Write {
+                pid,
+                tid: pid,
+                fd: 3,
+                bytes: 0,
+                result: 0,
+                latency_ns: 10,
+                emitted_ns: 5,
+            },
+            BpfEvent::Dup {
+                pid,
+                tid: pid,
+                old_fd: 4,
+                new_fd: 3,
+                emitted_ns: 6,
+            },
+            BpfEvent::Write {
+                pid,
+                tid: pid,
+                fd: 3,
+                bytes: 7,
+                result: 7,
+                latency_ns: 70,
+                emitted_ns: 7,
+            },
+            BpfEvent::Read {
+                pid,
+                tid: pid,
+                fd: 3,
+                bytes: 3,
+                result: 3,
+                latency_ns: 30,
+                emitted_ns: 8,
+            },
+            BpfEvent::Close {
+                pid,
+                tid: pid,
+                fd: 3,
+                emitted_ns: 9,
+            },
+        ];
+
+        let mut coalesced = AppState::new(Duration::from_secs(10), Vec::new());
+        let mut singles = AppState::new(Duration::from_secs(10), Vec::new());
+        for state in [&mut coalesced, &mut singles] {
+            state.fd_cache.store(pid, 3, "/tmp/old".to_string());
+            state.fd_cache.store(pid, 4, "/tmp/new".to_string());
+        }
+
+        coalesced.ingest(events.clone());
+        for event in events {
+            singles.ingest(vec![event]);
+        }
+
+        assert_eq!(coalesced.total_events, 9);
+        assert_eq!(coalesced.failed_io_events, 1);
+        assert_eq!(coalesced.zero_byte_io_events, 1);
+        assert_eq!(coalesced.fd_cache.lookup(pid, 3), None);
+        let old = &coalesced.tree.root.children["tmp"].children["old"];
+        let new = &coalesced.tree.root.children["tmp"].children["new"];
+        assert_eq!(old.stats.read_bytes, 15);
+        assert_eq!(old.stats.read_ops, 2);
+        assert_eq!(old.stats.write_bytes, 20);
+        assert_eq!(old.stats.write_ops, 1);
+        assert_eq!(old.stats.total_latency_ns, 350);
+        assert_eq!(old.stats.max_latency_ns, 200);
+        assert_eq!(new.stats.read_bytes, 3);
+        assert_eq!(new.stats.write_bytes, 7);
+        assert_eq!(new.stats.close_ops, 1);
+        assert_eq!(new.stats.total_latency_ns, 100);
+        assert_eq!(new.stats.max_latency_ns, 70);
+
+        assert_eq!(coalesced.tree.root.agg_stats, singles.tree.root.agg_stats);
+        assert_eq!(
+            coalesced.process_table.processes[&pid].stats,
+            singles.process_table.processes[&pid].stats
+        );
+        assert_eq!(
+            coalesced.global_rate.rate_bps(),
+            singles.global_rate.rate_bps()
+        );
+        assert_eq!(
+            coalesced.event_log.rate_for_prefix(
+                "/",
+                &FilterQuery::default(),
+                &coalesced.process_table,
+            ),
+            singles
+                .event_log
+                .rate_for_prefix("/", &FilterQuery::default(), &singles.process_table,)
+        );
+    }
+
+    #[test]
+    fn coalesced_pseudo_descriptor_counts_every_ignored_event() {
+        let pid = std::process::id();
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let mut state = AppState::new(Duration::from_secs(5), Vec::new());
+        let events = (0..3)
+            .map(|index| BpfEvent::Read {
+                pid,
+                tid: pid,
+                fd: fd as u32,
+                bytes: 1,
+                result: 1,
+                latency_ns: index + 1,
+                emitted_ns: index + 1,
+            })
+            .collect();
+
+        state.ingest(events);
+        unsafe {
+            libc::close(fd);
+        }
+
+        assert_eq!(state.ignored_non_file_events, 3);
+        assert!(state.tree.root.children.is_empty());
+    }
+
+    #[test]
     fn exclusions_match_complete_path_components() {
         let state = AppState::new(Duration::from_secs(5), vec!["/proc".to_string()]);
 
@@ -445,6 +849,30 @@ mod tests {
         }
 
         assert_eq!(state.fd_cache.lookup(pid, 1000), None);
+    }
+
+    #[test]
+    fn process_exit_flushes_pending_io_before_pid_cleanup() {
+        let mut state = AppState::new(Duration::from_secs(5), Vec::new());
+        let pid = u32::MAX;
+        state.fd_cache.store(pid, 3, "/tmp/file".to_string());
+        state.ingest(vec![
+            BpfEvent::Read {
+                pid,
+                tid: pid,
+                fd: 3,
+                bytes: 8,
+                result: 8,
+                latency_ns: 5,
+                emitted_ns: 1,
+            },
+            BpfEvent::ProcessExit { pid, emitted_ns: 2 },
+        ]);
+
+        let file = &state.tree.root.children["tmp"].children["file"];
+        assert_eq!(file.agg_stats.read_bytes, 8);
+        assert!(!file.per_process.contains_key(&pid));
+        assert!(!state.process_table.processes.contains_key(&pid));
     }
 
     #[test]
