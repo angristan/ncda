@@ -13,7 +13,21 @@ Built with [Aya](https://aya-rs.dev/) and [Ratatui](https://ratatui.rs/).
 
 The eBPF ring buffer exists since Linux 5.8, but kernels older than 6.1 are not part of the tested support range. The syscall decoder does not support x86 ia32/x32 or ARM AArch32 compatibility ABIs.
 
-## Install from source
+## Install
+
+### Homebrew on Linux
+
+```bash
+brew install angristan/tap/ncda
+```
+
+The formula installs both `ncda` and `ncda-bench` from static x86_64 or ARM64 release binaries.
+
+### Prebuilt release
+
+Linux x86_64 and ARM64 archives, SHA-256 checksums, and build provenance are published on the [GitHub releases page](https://github.com/angristan/ncda/releases).
+
+### Build from source
 
 ```bash
 rustup toolchain install 1.97.1
