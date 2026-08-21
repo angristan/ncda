@@ -4,6 +4,12 @@ on:
   workflow_run:
     workflows: [CI]
     types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing release version whose assets should be rebuilt
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,18 +20,20 @@ concurrency:
 
 jobs:
   release:
-    name: Create semantic release
+    name: Resolve release version
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     outputs:
-      version: ${{ steps.result.outputs.version }}
+      version: ${{ steps.automatic.outputs.version || steps.manual.outputs.version }}
     steps:
       - name: Check out validated main
+        if: github.event_name == 'workflow_run'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           ref: main
@@ -33,20 +41,24 @@ jobs:
           persist-credentials: false
 
       - name: Verify validated revision
+        if: github.event_name == 'workflow_run'
         env:
           EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: Install Node.js
+        if: github.event_name == 'workflow_run'
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: lts/*
 
       - name: Record previous release
+        if: github.event_name == 'workflow_run'
         id: previous
         run: echo "tag=$(git describe --tags --abbrev=0 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
 
       - name: Install release tooling
+        if: github.event_name == 'workflow_run'
         run: >-
           npm install --no-save --package-lock=false
           semantic-release
@@ -55,12 +67,14 @@ jobs:
           @semantic-release/git
 
       - name: Create release
+        if: github.event_name == 'workflow_run'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npx semantic-release
 
       - name: Export new version
-        id: result
+        if: github.event_name == 'workflow_run'
+        id: automatic
         env:
           PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
         run: |
@@ -69,6 +83,20 @@ jobs:
           if [[ -n "$latest_tag" && "$latest_tag" != "$PREVIOUS_TAG" ]]; then
             echo "version=${latest_tag#v}" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Export requested version
+        if: github.event_name == 'workflow_dispatch'
+        id: manual
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo 'invalid semantic version' >&2
+            exit 2
+          fi
+          gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
 
   build-binaries:
     name: Build ${{ matrix.platform }}
