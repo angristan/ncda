@@ -15,9 +15,10 @@ use ncda::tui::app::AppState;
 use ncda::{model, tui};
 
 #[derive(Debug, Parser)]
-#[clap(
+#[command(
     name = "ncda",
-    about = "Real-time file access monitor (ncdu for live I/O)"
+    about = "Real-time file access monitor (ncdu for live I/O)",
+    version
 )]
 struct Cli {
     /// Rolling rate window in seconds.

@@ -1,7 +1,13 @@
 [package]
 name = "ncda"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "An ncdu-like terminal monitor for live Linux file I/O"
+publish = false
 
 [dependencies]
 ncda-common = { path = "../ncda-common", features = ["user"] }
@@ -23,8 +29,8 @@ tokio = { workspace = true, features = [
     "sync",
     "time",
 ] }
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "underline-color"] }
+crossterm = "0.29"
 unicode-width = "0.2"
 
 [build-dependencies]

@@ -17,9 +17,10 @@ use ncda::bpf::{self, BpfEvent, ReaderDropCounters};
 const MAX_LATENCY_SAMPLES: usize = 1_000_000;
 
 #[derive(Debug, Parser)]
-#[clap(
+#[command(
     name = "ncda-bench",
-    about = "Reproducible sustained ncda capture benchmark"
+    about = "Reproducible sustained ncda capture benchmark",
+    version
 )]
 struct Cli {
     /// Measured workload duration.
