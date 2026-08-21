@@ -46,10 +46,43 @@ impl NodeStats {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
+
+    pub fn for_operations(
+        op: OpKind,
+        bytes: u64,
+        operations: u64,
+        total_latency_ns: u64,
+        max_latency_ns: u64,
+    ) -> Self {
+        match op {
+            OpKind::Open => Self {
+                open_ops: operations,
+                ..Self::default()
+            },
+            OpKind::Read => Self {
+                read_bytes: bytes,
+                read_ops: operations,
+                total_latency_ns,
+                max_latency_ns,
+                ..Self::default()
+            },
+            OpKind::Write => Self {
+                write_bytes: bytes,
+                write_ops: operations,
+                total_latency_ns,
+                max_latency_ns,
+                ..Self::default()
+            },
+            OpKind::Close => Self {
+                close_ops: operations,
+                ..Self::default()
+            },
+        }
+    }
 }
 
 /// Event kind for recording into the tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OpKind {
     Open,
     Read,
@@ -164,36 +197,36 @@ impl FileTree {
 
     /// Record an event for the given absolute path.
     pub fn record(&mut self, path: &str, pid: u32, op: OpKind, bytes: u64, latency_ns: u64) {
+        let delta = NodeStats::for_operations(op, bytes, 1, latency_ns, latency_ns);
+        self.record_stats(path, pid, &delta);
+    }
+
+    /// Apply an already aggregated operation delta to one path.
+    pub fn record_stats(&mut self, path: &str, pid: u32, delta: &NodeStats) {
         let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
         if components.is_empty() {
             return;
         }
 
-        // Each event contributes the same delta to every aggregate on its path.
-        // Applying it while walking avoids rescanning every sibling subtree.
+        // Each event group contributes the same delta to every aggregate on
+        // its path. Applying it while walking avoids rescanning siblings.
         let mut node = &mut self.root;
-        apply_stats(&mut node.agg_stats, op, bytes, latency_ns);
+        node.agg_stats.accumulate(delta);
         for (i, component) in components.iter().enumerate() {
             let is_last = i == components.len() - 1;
             node = node
                 .children
                 .entry(component.to_string())
                 .or_insert_with(|| TreeNode::new(component.to_string(), !is_last));
-            // If we previously guessed it was a file but now it has children, fix it.
             if !is_last {
                 node.is_dir = true;
             }
-            apply_stats(&mut node.agg_stats, op, bytes, latency_ns);
+            node.agg_stats.accumulate(delta);
         }
 
         // Direct and per-process statistics remain leaf-scoped.
-        apply_stats(&mut node.stats, op, bytes, latency_ns);
-        apply_stats(
-            node.per_process.entry(pid).or_default(),
-            op,
-            bytes,
-            latency_ns,
-        );
+        node.stats.accumulate(delta);
+        node.per_process.entry(pid).or_default().accumulate(delta);
     }
 
     /// Navigate to the node at the given path components.
@@ -213,29 +246,6 @@ impl FileTree {
     /// Remove PID-scoped breakdowns when a process generation ends.
     pub fn remove_process(&mut self, pid: u32) {
         remove_process_from_node(&mut self.root, pid);
-    }
-}
-
-fn apply_stats(stats: &mut NodeStats, op: OpKind, bytes: u64, latency_ns: u64) {
-    match op {
-        OpKind::Open => {
-            stats.open_ops = stats.open_ops.saturating_add(1);
-        }
-        OpKind::Read => {
-            stats.read_bytes = stats.read_bytes.saturating_add(bytes);
-            stats.read_ops = stats.read_ops.saturating_add(1);
-            stats.total_latency_ns = stats.total_latency_ns.saturating_add(latency_ns);
-            stats.max_latency_ns = stats.max_latency_ns.max(latency_ns);
-        }
-        OpKind::Write => {
-            stats.write_bytes = stats.write_bytes.saturating_add(bytes);
-            stats.write_ops = stats.write_ops.saturating_add(1);
-            stats.total_latency_ns = stats.total_latency_ns.saturating_add(latency_ns);
-            stats.max_latency_ns = stats.max_latency_ns.max(latency_ns);
-        }
-        OpKind::Close => {
-            stats.close_ops = stats.close_ops.saturating_add(1);
-        }
     }
 }
 
@@ -292,6 +302,22 @@ mod tests {
         assert_eq!(leaf.stats, leaf.agg_stats);
         assert_eq!(leaf.per_process[&3].read_ops, 1);
         assert_eq!(leaf.per_process[&42].write_ops, 1);
+    }
+
+    #[test]
+    fn aggregated_operations_preserve_counts_and_latency() {
+        let mut tree = FileTree::new();
+        let delta = NodeStats::for_operations(OpKind::Read, 12_288, 3, 60, 30);
+        tree.record_stats("/data/file", 7, &delta);
+
+        let file = &tree.root.children["data"].children["file"];
+        assert_eq!(file.stats.read_bytes, 12_288);
+        assert_eq!(file.stats.read_ops, 3);
+        assert_eq!(file.stats.total_latency_ns, 60);
+        assert_eq!(file.stats.max_latency_ns, 30);
+        assert_eq!(file.per_process[&7], delta);
+        assert_eq!(tree.root.agg_stats, delta);
+        assert_aggregate_invariants(&tree.root);
     }
 
     #[test]
