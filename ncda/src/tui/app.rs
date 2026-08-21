@@ -876,6 +876,50 @@ mod tests {
     }
 
     #[test]
+    fn process_exit_separates_reused_pid_in_same_batch() {
+        let mut state = AppState::new(Duration::from_secs(5), Vec::new());
+        let pid = u32::MAX;
+        state.fd_cache.store(pid, 3, "/old".to_string());
+        state.ingest(vec![
+            BpfEvent::Read {
+                pid,
+                tid: pid,
+                fd: 3,
+                bytes: 8,
+                result: 8,
+                latency_ns: 5,
+                emitted_ns: 1,
+            },
+            BpfEvent::ProcessExit { pid, emitted_ns: 2 },
+            BpfEvent::Open {
+                pid,
+                tid: pid,
+                fd: 3,
+                dirfd: libc::AT_FDCWD,
+                path: "/new".to_string(),
+                emitted_ns: 3,
+            },
+            BpfEvent::Write {
+                pid,
+                tid: pid,
+                fd: 3,
+                bytes: 13,
+                result: 13,
+                latency_ns: 7,
+                emitted_ns: 4,
+            },
+        ]);
+
+        let old = &state.tree.root.children["old"];
+        assert_eq!(old.agg_stats.read_bytes, 8);
+        assert!(!old.per_process.contains_key(&pid));
+        let new = &state.tree.root.children["new"];
+        assert_eq!(new.agg_stats.write_bytes, 13);
+        assert_eq!(new.per_process[&pid].write_bytes, 13);
+        assert_eq!(state.process_table.processes[&pid].stats.write_bytes, 13);
+    }
+
+    #[test]
     fn process_lifecycle_event_purges_pid_scoped_state() {
         let mut state = AppState::new(Duration::from_secs(5), Vec::new());
         let pid = u32::MAX;

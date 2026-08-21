@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Aggregated I/O statistics for a file or directory node.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -180,6 +181,10 @@ impl SortBy {
 /// The root of the filesystem activity tree.
 pub struct FileTree {
     pub root: TreeNode,
+    /// Canonical paths shared only while at least one process references them.
+    active_paths: HashMap<Arc<str>, usize>,
+    /// Reverse index used to remove process details without scanning the full tree.
+    paths_by_process: HashMap<u32, HashSet<Arc<str>>>,
 }
 
 impl Default for FileTree {
@@ -192,6 +197,8 @@ impl FileTree {
     pub fn new() -> Self {
         Self {
             root: TreeNode::new("/".into(), true),
+            active_paths: HashMap::new(),
+            paths_by_process: HashMap::new(),
         }
     }
 
@@ -224,9 +231,36 @@ impl FileTree {
             node.agg_stats.accumulate(delta);
         }
 
-        // Direct and per-process statistics remain leaf-scoped.
+        // Direct and per-process statistics remain leaf-scoped. Index a path
+        // only when this process first reaches it, keeping the steady-state
+        // I/O hot path free of reverse-index hash updates.
         node.stats.accumulate(delta);
-        node.per_process.entry(pid).or_default().accumulate(delta);
+        let first_process_activity = match node.per_process.entry(pid) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().accumulate(delta);
+                false
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(delta.clone());
+                true
+            }
+        };
+
+        if first_process_activity {
+            let path = self
+                .active_paths
+                .get_key_value(path)
+                .map(|(path, _)| Arc::clone(path))
+                .unwrap_or_else(|| Arc::from(path));
+            let inserted = self
+                .paths_by_process
+                .entry(pid)
+                .or_default()
+                .insert(Arc::clone(&path));
+            debug_assert!(inserted, "new process/path activity must be indexed once");
+            let references = self.active_paths.entry(path).or_default();
+            *references = references.saturating_add(1);
+        }
     }
 
     /// Navigate to the node at the given path components.
@@ -241,19 +275,42 @@ impl FileTree {
     /// Reset all activity and release historical path/process topology.
     pub fn reset(&mut self) {
         self.root = TreeNode::new("/".into(), true);
+        self.active_paths.clear();
+        self.paths_by_process.clear();
     }
 
     /// Remove PID-scoped breakdowns when a process generation ends.
+    ///
+    /// A process normally touches only a small part of the observed tree. The
+    /// reverse index keeps cleanup proportional to those paths instead of all
+    /// paths ever seen, which is important when short-lived processes churn.
     pub fn remove_process(&mut self, pid: u32) {
-        remove_process_from_node(&mut self.root, pid);
+        let Some(paths) = self.paths_by_process.remove(&pid) else {
+            return;
+        };
+        for path in paths {
+            if let Some(node) = find_node_mut(&mut self.root, &path) {
+                node.per_process.remove(&pid);
+            }
+            if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                self.active_paths.entry(path)
+            {
+                if *entry.get() <= 1 {
+                    entry.remove();
+                } else {
+                    *entry.get_mut() -= 1;
+                }
+            }
+        }
     }
 }
 
-fn remove_process_from_node(node: &mut TreeNode, pid: u32) {
-    node.per_process.remove(&pid);
-    for child in node.children.values_mut() {
-        remove_process_from_node(child, pid);
+fn find_node_mut<'a>(root: &'a mut TreeNode, path: &str) -> Option<&'a mut TreeNode> {
+    let mut node = root;
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        node = node.children.get_mut(component)?;
     }
+    Some(node)
 }
 
 #[cfg(test)]
@@ -339,6 +396,99 @@ mod tests {
     }
 
     #[test]
+    fn process_cleanup_visits_only_indexed_paths() {
+        let mut tree = FileTree::new();
+        for index in 0..1_000 {
+            tree.record(&format!("/history/file-{index}"), 10, OpKind::Read, 1, 1);
+        }
+        tree.record("/target", 20, OpKind::Write, 7, 11);
+        tree.record("/target", 20, OpKind::Write, 13, 17);
+
+        assert_eq!(tree.paths_by_process[&10].len(), 1_000);
+        assert_eq!(tree.paths_by_process[&20].len(), 1);
+        tree.remove_process(20);
+
+        let target = &tree.root.children["target"];
+        assert!(!target.per_process.contains_key(&20));
+        assert_eq!(target.agg_stats.write_bytes, 20);
+        assert_eq!(
+            tree.root.children["history"].children["file-999"].per_process[&10].read_bytes,
+            1
+        );
+        assert!(!tree.paths_by_process.contains_key(&20));
+    }
+
+    #[test]
+    fn short_process_churn_does_not_scan_historical_tree() {
+        let mut tree = FileTree::new();
+        for index in 0..10_000 {
+            tree.record(&format!("/history/file-{index}"), 1, OpKind::Read, 1, 1);
+        }
+
+        for pid in 2..=501 {
+            tree.record("/churn", pid, OpKind::Write, 1, 1);
+            tree.remove_process(pid);
+        }
+
+        assert_eq!(tree.paths_by_process.len(), 1);
+        assert_eq!(tree.paths_by_process[&1].len(), 10_000);
+        assert!(tree.root.children["churn"].per_process.is_empty());
+        assert_eq!(tree.root.children["churn"].agg_stats.write_ops, 500);
+    }
+
+    #[test]
+    fn process_cleanup_preserves_other_process_on_shared_path() {
+        let mut tree = FileTree::new();
+        tree.record("/shared", 7, OpKind::Read, 11, 13);
+        tree.record("/shared", 8, OpKind::Write, 17, 19);
+
+        tree.remove_process(7);
+
+        let shared = &tree.root.children["shared"];
+        assert!(!shared.per_process.contains_key(&7));
+        assert_eq!(shared.per_process[&8].write_bytes, 17);
+        assert_eq!(shared.agg_stats.read_bytes, 11);
+        assert_eq!(shared.agg_stats.write_bytes, 17);
+        assert_eq!(tree.active_paths["/shared"], 1);
+    }
+
+    #[test]
+    fn process_cleanup_separates_reused_pid_activity() {
+        let mut tree = FileTree::new();
+        tree.record("/old", 7, OpKind::Read, 11, 13);
+        tree.remove_process(7);
+        tree.record("/new", 7, OpKind::Write, 17, 19);
+
+        assert!(!tree.root.children["old"].per_process.contains_key(&7));
+        assert_eq!(tree.root.children["old"].agg_stats.read_bytes, 11);
+        assert_eq!(tree.root.children["new"].per_process[&7].write_bytes, 17);
+        assert_eq!(tree.paths_by_process[&7].len(), 1);
+
+        tree.remove_process(7);
+        tree.remove_process(7);
+        tree.remove_process(u32::MAX);
+        assert!(!tree.root.children["new"].per_process.contains_key(&7));
+        assert_eq!(tree.root.children["new"].agg_stats.write_bytes, 17);
+        assert!(tree.paths_by_process.is_empty());
+        assert!(tree.active_paths.is_empty());
+    }
+
+    #[test]
+    fn path_aliases_cleanup_the_same_leaf() {
+        let mut tree = FileTree::new();
+        tree.record("//a/b/", 7, OpKind::Read, 11, 13);
+        tree.record("/a/b", 7, OpKind::Write, 17, 19);
+
+        assert_eq!(tree.paths_by_process[&7].len(), 1);
+        tree.remove_process(7);
+
+        let leaf = &tree.root.children["a"].children["b"];
+        assert!(!leaf.per_process.contains_key(&7));
+        assert_eq!(leaf.agg_stats.read_bytes, 11);
+        assert_eq!(leaf.agg_stats.write_bytes, 17);
+    }
+
+    #[test]
     fn reset_releases_historical_topology() {
         let mut tree = FileTree::new();
         tree.record("/a/b", 7, OpKind::Read, 11, 13);
@@ -350,5 +500,7 @@ mod tests {
         assert_eq!(tree.root.stats, NodeStats::default());
         assert_eq!(tree.root.agg_stats, NodeStats::default());
         assert!(tree.root.per_process.is_empty());
+        assert!(tree.active_paths.is_empty());
+        assert!(tree.paths_by_process.is_empty());
     }
 }
