@@ -12,7 +12,8 @@ use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 
-use ncda::bpf::{self, BpfEvent, ReaderDropCounters};
+use ncda::bpf::{self, BpfEvent, ReaderDropCounters, ReaderDropSnapshot};
+use ncda_common::CaptureStats;
 
 const MAX_LATENCY_SAMPLES: usize = 1_000_000;
 
@@ -101,12 +102,20 @@ struct Report {
     syscall_latency_ns: LatencyReport,
     capture: CaptureReport,
     drops: DropReport,
+    counter_scope: CounterScope,
 }
 
 #[derive(Debug, Serialize)]
 struct Environment {
+    ncda_version: &'static str,
     architecture: &'static str,
+    build_target: &'static str,
     kernel_release: String,
+    os_release: String,
+    logical_cpus: usize,
+    userspace_rustc: &'static str,
+    ebpf_toolchain: &'static str,
+    bpf_linker: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -175,6 +184,14 @@ struct DropReport {
     kernel_scratch: u64,
     userspace_parse: u64,
     userspace_queue: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct CounterScope {
+    observed_events: &'static str,
+    capture_counters: &'static str,
+    kernel_drops: &'static str,
+    userspace_drops: &'static str,
 }
 
 struct BenchmarkFiles {
@@ -263,6 +280,8 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    let kernel_start = bpf::capture_stats(&capture_stats)?;
+    let userspace_start = reader_drops.snapshot();
     let start_ns = monotonic_ns();
     measurement_start.store(start_ns, Ordering::Release);
     let workload = run_workload_async(
@@ -274,6 +293,7 @@ async fn main() -> Result<()> {
     .await?;
     let end_ns = monotonic_ns();
     measurement_end.store(end_ns, Ordering::Release);
+    let kernel = subtract_capture_stats(bpf::capture_stats(&capture_stats)?, kernel_start);
 
     tokio::time::sleep(Duration::from_millis(cli.drain_ms)).await;
     drop(ebpf);
@@ -281,21 +301,29 @@ async fn main() -> Result<()> {
     reader_handle.await.context("reader task panicked")??;
     let mut observed = collector_handle.await.context("collector task panicked")?;
 
-    let kernel = bpf::capture_stats(&capture_stats)?;
-    let userspace = reader_drops.snapshot();
+    let userspace = subtract_drop_snapshot(reader_drops.snapshot(), userspace_start);
     let expected_events = workload.read_ops + workload.write_ops;
     let observed_events = observed.read_ops + observed.write_ops;
     let expected_bytes = workload.read_bytes + workload.write_bytes;
     let observed_bytes = observed.read_bytes + observed.write_bytes;
 
     let report = Report {
-        schema_version: 1,
+        schema_version: 2,
         environment: Environment {
+            ncda_version: env!("CARGO_PKG_VERSION"),
             architecture: std::env::consts::ARCH,
+            build_target: env!("NCDA_BUILD_TARGET"),
             kernel_release: std::fs::read_to_string("/proc/sys/kernel/osrelease")
                 .unwrap_or_default()
                 .trim()
                 .to_string(),
+            os_release: os_release(),
+            logical_cpus: std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1),
+            userspace_rustc: env!("NCDA_RUSTC_VERSION"),
+            ebpf_toolchain: env!("NCDA_EBPF_TOOLCHAIN"),
+            bpf_linker: env!("NCDA_BPF_LINKER_VERSION"),
         },
         configuration: Configuration {
             requested_duration_seconds: cli.duration_seconds,
@@ -327,6 +355,12 @@ async fn main() -> Result<()> {
             kernel_scratch: kernel.scratch_failures,
             userspace_parse: userspace.parse_drops,
             userspace_queue: userspace.queue_drops,
+        },
+        counter_scope: CounterScope {
+            observed_events: "benchmark PID, events emitted during the measurement interval",
+            capture_counters: "system-wide delta during the measurement interval",
+            kernel_drops: "system-wide delta during the measurement interval",
+            userspace_drops: "system-wide delta from measurement start through final drain",
         },
     };
 
@@ -405,24 +439,26 @@ async fn collect_metrics(
         let start_ns = measurement_start.load(Ordering::Acquire);
         let end_ns = measurement_end.load(Ordering::Acquire);
         for event in batch {
-            let (pid, bytes, syscall_latency_ns, emitted_ns, is_read) = match event {
+            let (pid, bytes, result, syscall_latency_ns, emitted_ns, is_read) = match event {
                 BpfEvent::Read {
                     pid,
                     bytes,
+                    result,
                     latency_ns,
                     emitted_ns,
                     ..
-                } => (pid, bytes, latency_ns, emitted_ns, true),
+                } => (pid, bytes, result, latency_ns, emitted_ns, true),
                 BpfEvent::Write {
                     pid,
                     bytes,
+                    result,
                     latency_ns,
                     emitted_ns,
                     ..
-                } => (pid, bytes, latency_ns, emitted_ns, false),
+                } => (pid, bytes, result, latency_ns, emitted_ns, false),
                 _ => continue,
             };
-            if pid != benchmark_pid || emitted_ns < start_ns || emitted_ns > end_ns {
+            if pid != benchmark_pid || result <= 0 || emitted_ns < start_ns || emitted_ns > end_ns {
                 continue;
             }
 
@@ -469,6 +505,44 @@ fn ratio(observed: u64, expected: u64) -> f64 {
     } else {
         observed as f64 / expected as f64
     }
+}
+
+fn subtract_capture_stats(end: CaptureStats, start: CaptureStats) -> CaptureStats {
+    CaptureStats {
+        ring_output_drops: end
+            .ring_output_drops
+            .saturating_sub(start.ring_output_drops),
+        stash_update_failures: end
+            .stash_update_failures
+            .saturating_sub(start.stash_update_failures),
+        scratch_failures: end.scratch_failures.saturating_sub(start.scratch_failures),
+        read_entries: end.read_entries.saturating_sub(start.read_entries),
+        write_entries: end.write_entries.saturating_sub(start.write_entries),
+        read_exits: end.read_exits.saturating_sub(start.read_exits),
+        write_exits: end.write_exits.saturating_sub(start.write_exits),
+    }
+}
+
+fn subtract_drop_snapshot(
+    end: ReaderDropSnapshot,
+    start: ReaderDropSnapshot,
+) -> ReaderDropSnapshot {
+    ReaderDropSnapshot {
+        parse_drops: end.parse_drops.saturating_sub(start.parse_drops),
+        queue_drops: end.queue_drops.saturating_sub(start.queue_drops),
+    }
+}
+
+fn os_release() -> String {
+    std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                line.strip_prefix("PRETTY_NAME=")
+                    .map(|value| value.trim_matches('"').to_string())
+            })
+        })
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn monotonic_ns() -> u64 {
@@ -524,5 +598,38 @@ mod tests {
     #[test]
     fn benchmark_rejects_zero_work() {
         assert_eq!(ratio(0, 0), 0.0);
+    }
+
+    #[test]
+    fn counter_deltas_exclude_warmup_and_saturate() {
+        let kernel = subtract_capture_stats(
+            CaptureStats {
+                ring_output_drops: 9,
+                read_entries: 101,
+                ..CaptureStats::default()
+            },
+            CaptureStats {
+                ring_output_drops: 7,
+                read_entries: 100,
+                write_entries: 5,
+                ..CaptureStats::default()
+            },
+        );
+        assert_eq!(kernel.ring_output_drops, 2);
+        assert_eq!(kernel.read_entries, 1);
+        assert_eq!(kernel.write_entries, 0);
+
+        let userspace = subtract_drop_snapshot(
+            ReaderDropSnapshot {
+                parse_drops: 12,
+                queue_drops: 8,
+            },
+            ReaderDropSnapshot {
+                parse_drops: 10,
+                queue_drops: 9,
+            },
+        );
+        assert_eq!(userspace.parse_drops, 2);
+        assert_eq!(userspace.queue_drops, 0);
     }
 }
