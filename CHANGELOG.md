@@ -1,3 +1,10 @@
+## [1.0.1](https://github.com/angristan/ncda/compare/v1.0.0...v1.0.1) (2026-08-21)
+
+
+### Bug Fixes
+
+* close promptly after output stops ([3d10b3e](https://github.com/angristan/ncda/commit/3d10b3e1830ed76d3d352e73c8971169780c18c4))
+
 # 1.0.0 (2026-08-21)
 
 
