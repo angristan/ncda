@@ -1,35 +1,64 @@
 # ncda
 
-Like [ncdu](https://dev.yorhel.nl/ncdu), but for live file I/O. Uses eBPF to monitor `openat`, `read`, `write`, and `close` syscalls system-wide and displays activity in an interactive TUI.
+`ncda` is an ncdu-like terminal monitor for live Linux file I/O. It uses eBPF raw syscall tracepoints and shows system-wide activity as a navigable directory tree, a flat directory view, or periodic text output.
 
 Built with [Aya](https://aya-rs.dev/) and [Ratatui](https://ratatui.rs/).
 
 ## Requirements
 
-- Linux 6.1+ on x86_64 or arm64
-- Root privileges (eBPF needs `CAP_BPF`)
-- Rust nightly `nightly-2026-08-04` + `bpf-linker` (for building)
+- Linux 6.1 or newer (supported and tested baseline)
+- Native x86_64 or AArch64 userspace
+- Root, or an equivalent set of eBPF, tracing, and memory-lock capabilities
+- Rust 1.97.1 plus `nightly-2026-08-04`, `rust-src`, and `bpf-linker` 0.11 to build
+
+The eBPF ring buffer exists since Linux 5.8, but kernels older than 6.1 are not part of the tested support range. The syscall decoder does not support x86 ia32/x32 or ARM AArch32 compatibility ABIs.
+
+## Install from source
+
+```bash
+rustup toolchain install 1.97.1
+rustup toolchain install nightly-2026-08-04 --profile minimal --component rust-src
+cargo install bpf-linker --version 0.11
+cargo build --release --locked --bins
+sudo install -m 0755 target/release/ncda /usr/local/bin/ncda
+```
+
+The eBPF nightly is pinned because its LLVM 22 bitcode matches `bpf-linker` 0.11. LLVM bitcode is not forward-compatible across major versions.
 
 ## Usage
 
 ```bash
-sudo ncda          # interactive TUI
-sudo ncda --stdout # periodic text summary
+ncda --help
+sudo ncda                         # interactive TUI
+sudo ncda --stdout                # periodic text summary
+sudo ncda --rate-window 10        # 10-second rolling rates
+sudo ncda --exclude /var/cache    # repeatable path exclusion
+sudo ncda --verbose
 ```
 
-## Building
+Default exclusions are `/proc`, `/sys`, and `/dev`. Exclusions match complete path components: `/proc` excludes `/proc/1/status`, not `/procfoo`. They apply before container names are added, so host and container paths have the same behavior.
 
-```bash
-cargo build --release
-```
+The TUI supports flat and tree views, path/PID/process/container filters, sortable process activity, and a built-in `?` help screen.
 
-Requires `nightly-2026-08-04` with `rust-src` and `bpf-linker`. The nightly is pinned because its LLVM 22 bitcode matches `bpf-linker` 0.11 on Arch; LLVM bitcode is not forward-compatible across major versions.
+## Capture and attribution semantics
 
-ncda uses the global raw syscall tracepoints with compile-time register and syscall-number decoders for x86_64 and arm64. Arm64 has no native `dup2`; libc uses `dup3` instead.
+`ncda` covers:
+
+- `openat` and `openat2`;
+- `read`, `write`, `pread64`, and `pwrite64`;
+- `readv`, `writev`, `preadv`, `pwritev`, `preadv2`, and `pwritev2`;
+- `dup`, `dup2`, `dup3`, and duplicating `fcntl` commands;
+- `close`, `close_range`, process exec, and process exit.
+
+Byte counts, operation counts, rates, and average syscall latency include only successful operations that transferred at least one byte. Latency is measured in the kernel from syscall entry to syscall exit; it excludes ring delivery and UI processing. Failed completions and successful zero-byte completions are captured separately as `Err` and `Zero` diagnostics.
+
+Path attribution is fail-safe. Descriptor replacement, range close, exec, and exit invalidate cached state. If a delayed relative open no longer matches the current descriptor target, activity is placed under `/[unresolved]/pid-<pid>/fd-<fd>/` instead of being assigned to a possibly wrong file. `Attr` counts attribution failures. Anonymous memory files are grouped under `/[memory]/`; sockets, pipes, and other non-file pseudo descriptors are hidden.
+
+`Drops` reports kernel ring/stash/scratch loss and userspace parse/queue loss. Any non-zero drop count means displayed activity is incomplete.
 
 ## Benchmarking
 
-`ncda-bench` runs deterministic positional file I/O while observing the same process. It reports sustained capture throughput, exact event and byte recall, syscall latency, kernel-to-userspace delivery latency, tracepoint coverage, and every loss counter as JSON.
+`ncda-bench` generates positional file I/O and emits JSON with throughput, exact event/byte recall, syscall latency, delivery latency, capture counters, loss counters, and environment metadata.
 
 ```bash
 cargo build --release --locked --bin ncda-bench
@@ -39,20 +68,25 @@ sudo ./target/release/ncda-bench \
   --output ncda-benchmark.json
 ```
 
-Use `--mode read`, `--mode write`, and `--mode mixed` as separate profiles. Run at least five repetitions per profile on an otherwise idle host. Do not compare runs with non-zero drops or recall below `1.0`. Delivery percentiles use at most the first one million measured events to bound benchmark memory.
+Observed events are restricted to the benchmark PID and measurement timestamps. Kernel capture/drop counters are system-wide measurement deltas. Userspace drop counters cover measurement through final drain. Unrelated host activity can therefore affect global counters even though it cannot affect workload recall. Run on an otherwise idle host, use separate read/write/mixed profiles, repeat each profile at least five times, and reject runs with drops or recall below `1.0`. Latency sample storage is capped at one million events.
 
 ## Testing
 
-Normal checks never use elevated privileges:
+Unprivileged quality checks:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+cargo build --release --locked --bins
 ```
 
-The ignored live-kernel suite validates openat/openat2, scalar, positional and vectored I/O, inherited descriptors, dup/dup2/dup3, close handling, loss counters, and final ring draining. Its wrapper builds as the current user, then runs only the test executable through a sanitized non-interactive sudo environment:
+The live-kernel suite validates syscall, descriptor-lifecycle, loss-accounting, and final-drain behavior. It builds without elevation and runs only the test executable through sanitized non-interactive `sudo`:
 
 ```bash
 scripts/test-ebpf.sh
 ```
+
+## License
+
+Repository source is licensed under the [MIT License](LICENSE). The eBPF object declares `Dual MIT/GPL` as kernel-loader metadata so GPL-only helpers remain available; this does not change the repository source license.

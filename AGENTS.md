@@ -2,137 +2,91 @@
 
 ## Project
 
-**ncda** -- an ncdu-like TUI for monitoring live file I/O on Linux using eBPF (Aya framework).
-
-Hooks into kernel syscall tracepoints (`openat`, `read`, `write`, `close`) to capture file access in real-time. Displays activity in an interactive terminal UI with flat (ncdu-style) and tree views.
+`ncda` is an ncdu-like Linux TUI for monitoring live file I/O with eBPF and Aya.
 
 ## Architecture
 
-```
-Kernel (eBPF tracepoints)
-  -> RingBuf (16 MiB)
-    -> Polling reader task (10ms)
-      -> mpsc channel
-        -> Aggregator (AppState)
-          -> TUI (ratatui) or stdout mode
+```text
+raw syscall tracepoints
+  -> 16 MiB eBPF RingBuf
+    -> AsyncFd readiness reader (bounded batches)
+      -> bounded Tokio mpsc channel
+        -> AppState aggregation
+          -> Ratatui TUI or stdout
 ```
 
-Three crates in one workspace:
+Workspace crates:
 
 | Crate | Role |
-|-------|------|
-| `ncda-common` | `#![no_std]` shared types (`OpenEvent`, `IoEvent`, constants) |
-| `ncda-ebpf` | eBPF programs (7 tracepoint handlers), compiled to `bpfel-unknown-none` |
-| `ncda` | Userspace binary: eBPF loader, event parser, data model, TUI |
+|---|---|
+| `ncda-common` | `no_std` kernel/userspace event ABI |
+| `ncda-ebpf` | eBPF raw tracepoint programs for x86_64 and AArch64 |
+| `ncda` | loader, path/process enrichment, model, TUI, and benchmark |
 
 ## Build
 
-### Requirements
+Requirements:
 
-- **Rust nightly** (needs `-Zbuild-std` for eBPF target)
-- `bpf-linker` (`cargo install bpf-linker`)
-- `rustup component add rust-src`
-- `clang` and `llvm` (for eBPF compilation)
-- Linux 6.1+ kernel at runtime
-
-### Development on macOS
-
-The aya crate is Linux-only. To type-check userspace code on macOS:
+- Linux on native x86_64 or AArch64
+- Rust 1.97.1
+- `nightly-2026-08-04` with `rust-src`
+- `bpf-linker` 0.11
 
 ```bash
-AYA_BUILD_SKIP=1 cargo check --package ncda --target aarch64-unknown-linux-gnu
-```
-
-This skips the eBPF build. The `include_bytes_aligned!` error for the missing eBPF binary is expected and unavoidable in this mode.
-
-### Full build on Linux
-
-```bash
-cargo build            # debug
-cargo build --release  # release
-```
-
-`ncda/build.rs` invokes `aya-build` which compiles `ncda-ebpf` into eBPF bytecode automatically.
-
-### Cross-compile for x86_64 from arm64
-
-```bash
-rustup target add x86_64-unknown-linux-gnu
-apt install gcc-x86-64-linux-gnu   # or equivalent
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
-  cargo build --release --target x86_64-unknown-linux-gnu
-```
-
-### Testing with OrbStack (from macOS)
-
-An OrbStack VM named `ncda-test` (Debian Bookworm, arm64) exists for testing:
-
-```bash
-# Shell in as root
-orb -m ncda-test -u root
-
-# Inside VM
-source $HOME/.cargo/env
-cd ~/ncda
 cargo build
-sudo ./target/debug/ncda --stdout
+cargo build --release --locked --bins
 ```
 
-To sync local changes into the VM before rebuilding:
+`ncda/build.rs` uses `aya-build` and the pinned eBPF nightly. The pin keeps LLVM 22 compatible with `bpf-linker` 0.11. Do not replace it with the default nightly without validating LLVM compatibility.
+
+The supported runtime baseline is Linux 6.1+. Ring buffers exist since 5.8, but older kernels are not tested. The raw decoder supports native x86_64 and AArch64 only, not x86 ia32/x32 or ARM AArch32 compatibility syscalls.
+
+## Test
 
 ```bash
-orb -m ncda-test bash -c '
-  cp -r /Users/stanislas/lab/ncda/ncda-ebpf/src ~/ncda/ncda-ebpf/src
-  cp -r /Users/stanislas/lab/ncda/ncda/src ~/ncda/ncda/src
-'
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --release --locked --bins
+scripts/test-ebpf.sh
 ```
 
-## Running
+Normal checks must remain unprivileged. `scripts/test-ebpf.sh` builds as the current user, then runs only the integration test executable with sanitized non-interactive `sudo`. CI must not run pull-request-controlled code as root.
 
-Requires root (eBPF needs `CAP_BPF` / `CAP_SYS_ADMIN`):
+## Capture model
 
-```bash
-sudo ./target/debug/ncda          # TUI mode
-sudo ./target/debug/ncda --stdout # periodic text summary
-sudo ./target/debug/ncda -v       # verbose logging
-```
+Capture covers openat/openat2; scalar, positional, vectored, and v2 read/write calls; dup/dup2/dup3 and duplicating fcntl; close/close_range; exec; and process exit.
+
+Entry/exit stashes correlate syscalls by `pid_tgid`. Per-CPU scratch buffers avoid the eBPF stack limit. Kernel and userspace loss counters must remain visible.
+
+Path resolution happens in userspace. FD state is invalidated on replacement, range close, exec, and exit. Delayed or ambiguous resolution must fail into `/[unresolved]/pid-<pid>/...`, never a plausible wrong filesystem path. Pseudo descriptors are excluded and memfds use `/[memory]/`.
+
+Only successful positive-byte I/O contributes to bytes, operations, rates, and average syscall latency. Failed and zero-byte completions are diagnostic counters.
+
+## Performance rules
+
+- Keep ring drains and channels bounded.
+- Do not scan all historical events for every rendered row.
+- Propagate tree deltas in O(path depth); do not rescan siblings.
+- Do not run external container-runtime commands while holding `AppState`.
+- Bound caches and expire rolling-rate state during idle queries.
 
 ## Code map
 
-### `ncda-ebpf/src/main.rs`
-Seven tracepoint handlers. Five eBPF maps:
-- `EVENTS` -- RingBuf for kernel-to-user event delivery
-- `OPEN_STASH` / `RW_STASH` -- HashMaps correlating syscall entry/exit pairs
-- `SCRATCH` / `EVENT_BUF` -- PerCpuArray scratch buffers (avoids 512-byte stack limit)
+- `ncda-ebpf/src/main.rs`: raw syscall handlers, stashes, ring output, capture counters.
+- `ncda/src/bpf.rs`: loader, attachments, bounded async reader, parser, FD/path cache.
+- `ncda/src/model.rs`: hierarchical aggregate model.
+- `ncda/src/rate.rs`: bounded rolling-rate buckets.
+- `ncda/src/container.rs`: process/container enrichment and bounded discovery commands.
+- `ncda/src/tui/app.rs`: event ingestion and application state.
+- `ncda/src/tui/`: rendering, input, layout, help, and panels.
+- `ncda/src/bin/ncda-bench.rs`: reproducible capture benchmark.
 
-### `ncda/src/bpf.rs`
-eBPF loader, tracepoint attachment, ring buffer polling, raw event parsing, `FdPathCache` (pid,fd -> path mapping in userspace).
+## Benchmark
 
-### `ncda/src/model.rs`
-`FileTree` with `TreeNode` hierarchy. `NodeStats` for aggregated I/O metrics. `SortBy` enum with 6 criteria. `record()` walks path components, updates leaf stats, propagates aggregates upward.
+```bash
+sudo ./target/release/ncda-bench --warmup-seconds 2 --duration-seconds 30 \
+  --threads 1 --mode mixed --block-size 4096
+```
 
-### `ncda/src/tui/app.rs`
-`AppState` -- shared state holding tree, fd cache, process table, rate tracker, event log. `ingest()` processes batches of `BpfEvent`s. `ViewState` -- TUI-local navigation state.
-
-### `ncda/src/tui/`
-- `flat_view.rs` -- ncdu-style directory listing with bar graphs
-- `tree_view.rs` -- expandable tree with flatten logic
-- `input.rs` -- keybinding dispatch
-- `header.rs` / `footer.rs` -- chrome
-- `mod.rs` -- main render loop, help overlay, process panel
-
-## Key design decisions
-
-- **Tracepoints over fentry/fexit**: More portable, avoids `bpf_d_path` complexity.
-- **Path resolution in userspace**: eBPF captures filenames at `openat` only. The `FdPathCache` in userspace maps (pid, fd) to paths. Read/write events carry only fd + byte count.
-- **PerCpuArray scratch buffers**: `OpenArgs` is 264 bytes, too large for reliable eBPF stack use. Scratch buffers avoid hitting the 512-byte stack limit.
-- **Owned `RingBuf<MapData>`**: Uses `Ebpf::take_map()` (not `map_mut()`) so the ring buffer can be moved into a `'static` tokio task.
-- **Polling over async**: `reader_loop_polling` (10ms sleep) is used instead of `AsyncFd`-based epoll for reliability. The async `reader_loop` exists but is unused.
-
-## eBPF API notes
-
-These apply to the current aya-ebpf version (git HEAD):
-- `HashMap::get()` requires `unsafe`; `HashMap::insert()` and `HashMap::remove()` do **not**.
-- `PerCpuArray::get_ptr_mut()` does **not** require `unsafe`.
-- `RingBuf::output()` needs turbofish type annotation: `EVENTS.output::<IoEvent>(&event, 0)` -- otherwise `Borrow<T>` is ambiguous.
-- `EbpfLogger::init()` is self-contained (spawns its own tokio tasks). Do not wrap in `AsyncFd`.
+Observed workload metrics are PID/timestamp scoped. Kernel counters are system-wide measurement deltas. Userspace drops include final drain. Keep these scopes explicit when changing the report schema.
