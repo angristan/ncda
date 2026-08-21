@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 /// Aggregated I/O statistics for a file or directory node.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NodeStats {
     pub read_bytes: u64,
     pub write_bytes: u64,
@@ -104,13 +104,6 @@ impl TreeNode {
         });
         children
     }
-
-    fn recompute_agg_stats(&mut self) {
-        self.agg_stats = self.stats.clone();
-        for child in self.children.values() {
-            self.agg_stats.accumulate(&child.agg_stats);
-        }
-    }
 }
 
 /// Sort criteria for the file list.
@@ -173,29 +166,31 @@ impl FileTree {
             return;
         }
 
-        // Walk/create nodes along the path
+        // Each event contributes the same delta to every aggregate on its path.
+        // Applying it while walking avoids rescanning every sibling subtree.
         let mut node = &mut self.root;
+        apply_stats(&mut node.agg_stats, op, bytes, latency_ns);
         for (i, component) in components.iter().enumerate() {
             let is_last = i == components.len() - 1;
             node = node
                 .children
                 .entry(component.to_string())
                 .or_insert_with(|| TreeNode::new(component.to_string(), !is_last));
-            // If we previously guessed it was a file but now it has children, fix it
+            // If we previously guessed it was a file but now it has children, fix it.
             if !is_last {
                 node.is_dir = true;
             }
+            apply_stats(&mut node.agg_stats, op, bytes, latency_ns);
         }
 
-        // Update the leaf node's stats
+        // Direct and per-process statistics remain leaf-scoped.
         apply_stats(&mut node.stats, op, bytes, latency_ns);
-
-        // Update per-process stats on the leaf
-        let proc_stats = node.per_process.entry(pid).or_default();
-        apply_stats(proc_stats, op, bytes, latency_ns);
-
-        // Propagate aggregates up the tree
-        self.propagate_agg(&components);
+        apply_stats(
+            node.per_process.entry(pid).or_default(),
+            op,
+            bytes,
+            latency_ns,
+        );
     }
 
     /// Navigate to the node at the given path components.
@@ -210,22 +205,6 @@ impl FileTree {
     /// Reset all stats in the tree.
     pub fn reset(&mut self) {
         reset_node(&mut self.root);
-    }
-
-    /// Recompute agg_stats for nodes along a path (bottom-up).
-    fn propagate_agg(&mut self, components: &[&str]) {
-        // Collect indices of nodes along the path, then recompute bottom-up.
-        // We do this by walking top-down, then recomputing at each level.
-        // This is O(depth * max_children_at_level), which is fast in practice.
-        fn recompute_path(node: &mut TreeNode, components: &[&str], depth: usize) {
-            if depth < components.len() {
-                if let Some(child) = node.children.get_mut(components[depth]) {
-                    recompute_path(child, components, depth + 1);
-                }
-            }
-            node.recompute_agg_stats();
-        }
-        recompute_path(&mut self.root, components, 0);
     }
 }
 
@@ -258,5 +237,93 @@ fn reset_node(node: &mut TreeNode) {
     node.per_process.clear();
     for child in node.children.values_mut() {
         reset_node(child);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recomputed_aggregate(node: &TreeNode) -> NodeStats {
+        let mut total = node.stats.clone();
+        for child in node.children.values() {
+            total.accumulate(&recomputed_aggregate(child));
+        }
+        total
+    }
+
+    fn assert_aggregate_invariants(node: &TreeNode) {
+        assert_eq!(node.agg_stats, recomputed_aggregate(node), "{}", node.name);
+        for child in node.children.values() {
+            assert_aggregate_invariants(child);
+        }
+    }
+
+    #[test]
+    fn delta_propagation_preserves_fanout_aggregates() {
+        let mut tree = FileTree::new();
+        for index in 0..1_000 {
+            tree.record(
+                &format!("/fanout/dir-{index}/file"),
+                index % 7,
+                OpKind::Read,
+                index as u64 + 1,
+                index as u64,
+            );
+        }
+        tree.record("/fanout/dir-500/file", 42, OpKind::Write, 99, 20_000);
+        tree.record("/other/file", 42, OpKind::Open, 0, 0);
+        tree.record("/other/file", 42, OpKind::Close, 0, 0);
+
+        assert_aggregate_invariants(&tree.root);
+        let fanout = tree.root.children.get("fanout").unwrap();
+        assert_eq!(fanout.stats, NodeStats::default());
+        assert_eq!(fanout.agg_stats.read_ops, 1_000);
+        assert_eq!(fanout.agg_stats.write_bytes, 99);
+        assert_eq!(fanout.agg_stats.max_latency_ns, 20_000);
+
+        let leaf = &fanout.children["dir-500"].children["file"];
+        assert_eq!(leaf.stats, leaf.agg_stats);
+        assert_eq!(leaf.per_process[&3].read_ops, 1);
+        assert_eq!(leaf.per_process[&42].write_ops, 1);
+    }
+
+    #[test]
+    fn direct_and_descendant_deltas_are_not_double_counted() {
+        let mut tree = FileTree::new();
+        tree.record("/a", 1, OpKind::Read, 5, 7);
+        tree.record("/a/b", 2, OpKind::Write, 11, 13);
+
+        let a = tree.root.children.get("a").unwrap();
+        assert!(a.is_dir);
+        assert_eq!(a.stats.read_bytes, 5);
+        assert_eq!(a.stats.write_bytes, 0);
+        assert_eq!(a.agg_stats.read_bytes, 5);
+        assert_eq!(a.agg_stats.write_bytes, 11);
+        assert_eq!(a.per_process[&1].read_bytes, 5);
+        assert!(!a.per_process.contains_key(&2));
+        assert_eq!(a.children["b"].per_process[&2].write_bytes, 11);
+        assert_aggregate_invariants(&tree.root);
+    }
+
+    #[test]
+    fn reset_keeps_topology_and_clears_all_statistics() {
+        let mut tree = FileTree::new();
+        tree.record("/a/b", 7, OpKind::Read, 11, 13);
+        tree.record("/a/c", 8, OpKind::Write, 17, 19);
+
+        tree.reset();
+
+        assert!(tree.get_node(&["a".into(), "b".into()]).is_some());
+        assert_aggregate_invariants(&tree.root);
+        fn assert_reset(node: &TreeNode) {
+            assert_eq!(node.stats, NodeStats::default());
+            assert_eq!(node.agg_stats, NodeStats::default());
+            assert!(node.per_process.is_empty());
+            for child in node.children.values() {
+                assert_reset(child);
+            }
+        }
+        assert_reset(&tree.root);
     }
 }
