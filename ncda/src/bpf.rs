@@ -141,6 +141,8 @@ pub fn load_and_attach(ebpf: &mut Ebpf) -> Result<()> {
     Ok(())
 }
 
+const MAX_BATCH_EVENTS: usize = 4096;
+
 /// Read ring-buffer events using epoll readiness instead of periodic polling.
 /// The caller detaches all producers before requesting shutdown, allowing one
 /// final nonblocking drain to consume every record already in the ring.
@@ -155,28 +157,43 @@ pub async fn reader_loop(
     loop {
         tokio::select! {
             result = shutdown.changed() => {
-                let batch = drain_ring(async_fd.get_mut(), &drops);
-                send_batch(&tx, batch, &drops).await;
+                loop {
+                    let (batch, drained) = drain_ring_batch(async_fd.get_mut(), &drops);
+                    if !send_batch(&tx, batch, &drops).await || drained {
+                        break;
+                    }
+                }
                 if result.is_err() || *shutdown.borrow() {
                     return Ok(());
                 }
             }
             ready = async_fd.readable_mut() => {
                 let mut guard = ready?;
-                let batch = drain_ring(guard.get_inner_mut(), &drops);
-                guard.clear_ready();
+                let (batch, drained) = drain_ring_batch(guard.get_inner_mut(), &drops);
+                if drained {
+                    guard.clear_ready();
+                }
                 drop(guard);
                 if !send_batch(&tx, batch, &drops).await {
                     return Ok(());
+                }
+                if !drained {
+                    tokio::task::yield_now().await;
                 }
             }
         }
     }
 }
 
-fn drain_ring(ring_buf: &mut RingBuf<MapData>, drops: &ReaderDropCounters) -> Vec<BpfEvent> {
-    let mut batch = Vec::with_capacity(256);
-    while let Some(item) = ring_buf.next() {
+fn drain_ring_batch(
+    ring_buf: &mut RingBuf<MapData>,
+    drops: &ReaderDropCounters,
+) -> (Vec<BpfEvent>, bool) {
+    let mut batch = Vec::with_capacity(MAX_BATCH_EVENTS.min(256));
+    for _ in 0..MAX_BATCH_EVENTS {
+        let Some(item) = ring_buf.next() else {
+            return (batch, true);
+        };
         let data: &[u8] = &item;
         if let Some(event) = parse_event(data) {
             batch.push(event);
@@ -184,7 +201,7 @@ fn drain_ring(ring_buf: &mut RingBuf<MapData>, drops: &ReaderDropCounters) -> Ve
             drops.record_parse_drop();
         }
     }
-    batch
+    (batch, false)
 }
 
 async fn send_batch(
