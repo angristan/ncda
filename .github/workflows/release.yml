@@ -78,7 +78,6 @@ jobs:
         env:
           PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
         run: |
-          git fetch --tags --force
           latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || true)
           if [[ -n "$latest_tag" && "$latest_tag" != "$PREVIOUS_TAG" ]]; then
             echo "version=${latest_tag#v}" >> "$GITHUB_OUTPUT"
