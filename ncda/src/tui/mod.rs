@@ -27,9 +27,24 @@ use ratatui::Terminal;
 use self::app::{AppState, PaneFocus, ViewMode, ViewState};
 
 /// Restores terminal state on success, errors, and unwinding panics.
-struct TerminalRestoreGuard;
+trait RestoreTerminal {
+    fn restore(&mut self);
+}
 
-impl TerminalRestoreGuard {
+struct CrosstermRestore;
+
+impl RestoreTerminal for CrosstermRestore {
+    fn restore(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+    }
+}
+
+struct TerminalRestoreGuard<R: RestoreTerminal> {
+    restorer: R,
+}
+
+impl TerminalRestoreGuard<CrosstermRestore> {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -37,14 +52,15 @@ impl TerminalRestoreGuard {
             let _ = disable_raw_mode();
             return Err(error);
         }
-        Ok(Self)
+        Ok(Self {
+            restorer: CrosstermRestore,
+        })
     }
 }
 
-impl Drop for TerminalRestoreGuard {
+impl<R: RestoreTerminal> Drop for TerminalRestoreGuard<R> {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        self.restorer.restore();
     }
 }
 
@@ -647,12 +663,47 @@ fn process_metric(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use ratatui::backend::TestBackend;
 
     use crate::model::{NodeStats, OpKind, SortBy};
     use crate::process::{ProcessInfo, ProcessSort};
 
     use super::*;
+
+    struct RecordingRestore(Arc<AtomicUsize>);
+
+    impl RestoreTerminal for RecordingRestore {
+        fn restore(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn terminal_guard_restores_on_error_and_panic() {
+        let restorations = Arc::new(AtomicUsize::new(0));
+        let error_path = || -> Result<(), &'static str> {
+            let _guard = TerminalRestoreGuard {
+                restorer: RecordingRestore(Arc::clone(&restorations)),
+            };
+            Err("render failed")
+        };
+        assert!(error_path().is_err());
+        assert_eq!(restorations.load(Ordering::SeqCst), 1);
+
+        let panic_result = std::panic::catch_unwind({
+            let restorations = Arc::clone(&restorations);
+            move || {
+                let _guard = TerminalRestoreGuard {
+                    restorer: RecordingRestore(restorations),
+                };
+                panic!("input failed");
+            }
+        });
+        assert!(panic_result.is_err());
+        assert_eq!(restorations.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn process_name_column_fills_wide_panels() {
