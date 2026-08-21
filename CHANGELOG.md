@@ -1,3 +1,10 @@
+## [1.0.3](https://github.com/angristan/ncda/compare/v1.0.2...v1.0.3) (2026-08-21)
+
+
+### Performance Improvements
+
+* index process paths for cleanup ([f4a0597](https://github.com/angristan/ncda/commit/f4a0597c389d9aa297556e516c757d81d24bb222))
+
 ## [1.0.2](https://github.com/angristan/ncda/compare/v1.0.1...v1.0.2) (2026-08-21)
 
 
