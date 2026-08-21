@@ -12,12 +12,12 @@ Output docs/assets/ncda-demo.gif
 Set Shell "bash"
 Set Width 1500
 Set Height 760
-Set FontSize 16
-Set FontFamily "Adwaita Mono"
-Set LineHeight 1.1
+Set FontSize 18
+Set FontFamily "JetBrains Mono"
+Set LineHeight 1.05
 Set Framerate 15
 Set TypingSpeed 35ms
-Set Theme "TokyoNight"
+Set Theme "GruvboxDark"
 Set Padding 8
 Set CursorBlink false
 
