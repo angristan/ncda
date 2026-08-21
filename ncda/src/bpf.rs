@@ -349,7 +349,7 @@ impl FdPathCache {
     }
 
     /// Resolve the true file path for a given pid/fd via procfs.
-    /// Falls back to the raw eBPF-captured path if resolution fails.
+    /// Unresolved relative paths are kept in an explicit diagnostic namespace.
     fn resolve_fd_path(&mut self, pid: u32, fd: u32, dirfd: i32, raw_path: &str) -> String {
         // Try readlink on /proc/pid/fd/fd to get the kernel-resolved path.
         // This works even for relative openat(dirfd, name, ...) calls
@@ -363,6 +363,13 @@ impl FdPathCache {
                     return self.strip_container_root(pid, s);
                 }
             }
+        }
+
+        // A cache miss for inherited or pre-existing descriptors has no raw
+        // path. Never substitute the process cwd: it describes a directory,
+        // not the descriptor that performed the I/O.
+        if raw_path.is_empty() {
+            return String::new();
         }
 
         // If the raw path is already absolute, use it as-is
@@ -384,8 +391,10 @@ impl FdPathCache {
             }
         }
 
-        // Last resort: return the raw path as captured by eBPF.
-        raw_path.to_string()
+        // The process or descriptor can disappear before userspace performs
+        // procfs resolution. Preserve that activity without presenting a raw
+        // basename as if it existed at the filesystem root.
+        format!("/[unresolved]/pid-{pid}/{raw_path}")
     }
 
     /// Strip the container's root filesystem prefix from a host-side path.
@@ -503,6 +512,21 @@ mod tests {
         let resolved = cache.resolve(std::process::id(), u32::MAX, directory.as_raw_fd(), "child");
 
         assert_eq!(resolved, "/tmp/child");
+    }
+
+    #[test]
+    fn unresolved_relative_paths_do_not_pollute_root() {
+        let mut cache = FdPathCache::new();
+        let resolved = cache.resolve(u32::MAX, u32::MAX, libc::AT_FDCWD, "b006");
+
+        assert_eq!(resolved, "/[unresolved]/pid-4294967295/b006");
+    }
+
+    #[test]
+    fn missing_preexisting_descriptor_does_not_resolve_to_cwd() {
+        let mut cache = FdPathCache::new();
+
+        assert_eq!(cache.resolve_existing(std::process::id(), u32::MAX), None);
     }
 
     #[test]
