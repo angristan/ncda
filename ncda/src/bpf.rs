@@ -110,13 +110,19 @@ pub fn capture_stats(map: &PerCpuArray<MapData, CaptureStats>) -> Result<Capture
     Ok(values
         .iter()
         .fold(CaptureStats::default(), |mut total, value| {
-            total.ring_output_drops += value.ring_output_drops;
-            total.stash_update_failures += value.stash_update_failures;
-            total.scratch_failures += value.scratch_failures;
-            total.read_entries += value.read_entries;
-            total.write_entries += value.write_entries;
-            total.read_exits += value.read_exits;
-            total.write_exits += value.write_exits;
+            total.ring_output_drops = total
+                .ring_output_drops
+                .saturating_add(value.ring_output_drops);
+            total.stash_update_failures = total
+                .stash_update_failures
+                .saturating_add(value.stash_update_failures);
+            total.scratch_failures = total
+                .scratch_failures
+                .saturating_add(value.scratch_failures);
+            total.read_entries = total.read_entries.saturating_add(value.read_entries);
+            total.write_entries = total.write_entries.saturating_add(value.write_entries);
+            total.read_exits = total.read_exits.saturating_add(value.read_exits);
+            total.write_exits = total.write_exits.saturating_add(value.write_exits);
             total
         }))
 }

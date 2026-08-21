@@ -84,21 +84,27 @@ static CAPTURE_STATS: PerCpuArray<CaptureStats> = PerCpuArray::with_max_entries(
 #[inline(always)]
 fn record_ring_drop() {
     if let Some(stats) = CAPTURE_STATS.get_ptr_mut(0) {
-        unsafe { (*stats).ring_output_drops += 1 };
+        unsafe {
+            (*stats).ring_output_drops = (*stats).ring_output_drops.saturating_add(1);
+        };
     }
 }
 
 #[inline(always)]
 fn record_stash_failure() {
     if let Some(stats) = CAPTURE_STATS.get_ptr_mut(0) {
-        unsafe { (*stats).stash_update_failures += 1 };
+        unsafe {
+            (*stats).stash_update_failures = (*stats).stash_update_failures.saturating_add(1);
+        };
     }
 }
 
 #[inline(always)]
 fn record_scratch_failure() {
     if let Some(stats) = CAPTURE_STATS.get_ptr_mut(0) {
-        unsafe { (*stats).scratch_failures += 1 };
+        unsafe {
+            (*stats).scratch_failures = (*stats).scratch_failures.saturating_add(1);
+        };
     }
 }
 
@@ -107,9 +113,9 @@ fn record_io_entry(kind: u32) {
     if let Some(stats) = CAPTURE_STATS.get_ptr_mut(0) {
         unsafe {
             if kind == EVENT_READ {
-                (*stats).read_entries += 1;
+                (*stats).read_entries = (*stats).read_entries.saturating_add(1);
             } else {
-                (*stats).write_entries += 1;
+                (*stats).write_entries = (*stats).write_entries.saturating_add(1);
             }
         }
     }
@@ -120,9 +126,9 @@ fn record_io_exit(kind: u32) {
     if let Some(stats) = CAPTURE_STATS.get_ptr_mut(0) {
         unsafe {
             if kind == EVENT_READ {
-                (*stats).read_exits += 1;
+                (*stats).read_exits = (*stats).read_exits.saturating_add(1);
             } else {
-                (*stats).write_exits += 1;
+                (*stats).write_exits = (*stats).write_exits.saturating_add(1);
             }
         }
     }

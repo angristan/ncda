@@ -52,7 +52,7 @@ impl AppState {
     /// Ingest a batch of BPF events into the state.
     pub fn ingest(&mut self, events: Vec<BpfEvent>) {
         for event in events {
-            self.total_events += 1;
+            self.total_events = self.total_events.saturating_add(1);
             match event {
                 BpfEvent::Open {
                     pid,
@@ -65,11 +65,12 @@ impl AppState {
                     let resolved = match self.fd_cache.resolve(pid, fd, dirfd, &path) {
                         PathResolution::Resolved(path) => path,
                         PathResolution::Unresolved(path) => {
-                            self.attribution_failures += 1;
+                            self.attribution_failures = self.attribution_failures.saturating_add(1);
                             path
                         }
                         PathResolution::Ignored => {
-                            self.ignored_non_file_events += 1;
+                            self.ignored_non_file_events =
+                                self.ignored_non_file_events.saturating_add(1);
                             continue;
                         }
                     };
@@ -93,6 +94,9 @@ impl AppState {
                     emitted_ns: _,
                 } => {
                     self.record_io_outcome(result);
+                    if result <= 0 {
+                        continue;
+                    }
                     if let Some(path) = self.resolve_fd_path(pid, fd) {
                         if self.is_excluded(&path) {
                             continue;
@@ -115,6 +119,9 @@ impl AppState {
                     emitted_ns: _,
                 } => {
                     self.record_io_outcome(result);
+                    if result <= 0 {
+                        continue;
+                    }
                     if let Some(path) = self.resolve_fd_path(pid, fd) {
                         if self.is_excluded(&path) {
                             continue;
@@ -184,9 +191,9 @@ impl AppState {
 
     fn record_io_outcome(&mut self, result: i64) {
         if result < 0 {
-            self.failed_io_events += 1;
+            self.failed_io_events = self.failed_io_events.saturating_add(1);
         } else if result == 0 {
-            self.zero_byte_io_events += 1;
+            self.zero_byte_io_events = self.zero_byte_io_events.saturating_add(1);
         }
     }
 
@@ -204,11 +211,11 @@ impl AppState {
         let resolved = match self.fd_cache.resolve_existing(pid, fd) {
             PathResolution::Resolved(path) => path,
             PathResolution::Unresolved(path) => {
-                self.attribution_failures += 1;
+                self.attribution_failures = self.attribution_failures.saturating_add(1);
                 path
             }
             PathResolution::Ignored => {
-                self.ignored_non_file_events += 1;
+                self.ignored_non_file_events = self.ignored_non_file_events.saturating_add(1);
                 return None;
             }
         };
@@ -372,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_and_zero_byte_io_are_counted_as_operations() {
+    fn failed_and_zero_byte_io_are_diagnostic_only() {
         let mut state = AppState::new(Duration::from_secs(5), Vec::new());
         let pid = u32::MAX;
         state.fd_cache.store(pid, 3, "/tmp/file".to_string());
@@ -397,10 +404,7 @@ mod tests {
             },
         ]);
 
-        let file = &state.tree.root.children["tmp"].children["file"];
-        assert_eq!(file.stats.read_ops, 2);
-        assert_eq!(file.stats.read_bytes, 0);
-        assert_eq!(file.stats.avg_latency_ns(), 12);
+        assert!(state.tree.root.children.is_empty());
         assert_eq!(state.failed_io_events, 1);
         assert_eq!(state.zero_byte_io_events, 1);
     }

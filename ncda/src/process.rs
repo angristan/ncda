@@ -90,20 +90,22 @@ impl ProcessTable {
             info.container = container.map(str::to_string);
         }
         match op {
-            OpKind::Open => info.stats.open_ops += 1,
+            OpKind::Open => info.stats.open_ops = info.stats.open_ops.saturating_add(1),
             OpKind::Read => {
-                info.stats.read_bytes += bytes;
-                info.stats.read_ops += 1;
-                info.stats.total_latency_ns += latency_ns;
+                info.stats.read_bytes = info.stats.read_bytes.saturating_add(bytes);
+                info.stats.read_ops = info.stats.read_ops.saturating_add(1);
+                info.stats.total_latency_ns =
+                    info.stats.total_latency_ns.saturating_add(latency_ns);
                 info.stats.max_latency_ns = info.stats.max_latency_ns.max(latency_ns);
             }
             OpKind::Write => {
-                info.stats.write_bytes += bytes;
-                info.stats.write_ops += 1;
-                info.stats.total_latency_ns += latency_ns;
+                info.stats.write_bytes = info.stats.write_bytes.saturating_add(bytes);
+                info.stats.write_ops = info.stats.write_ops.saturating_add(1);
+                info.stats.total_latency_ns =
+                    info.stats.total_latency_ns.saturating_add(latency_ns);
                 info.stats.max_latency_ns = info.stats.max_latency_ns.max(latency_ns);
             }
-            OpKind::Close => info.stats.close_ops += 1,
+            OpKind::Close => info.stats.close_ops = info.stats.close_ops.saturating_add(1),
         }
     }
 

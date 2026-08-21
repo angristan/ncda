@@ -63,7 +63,7 @@ impl RateTracker {
                 .is_some_and(|elapsed| elapsed < self.bucket_width)
         }) {
             bucket.latest_at = now;
-            bucket.bytes += bytes;
+            bucket.bytes = bucket.bytes.saturating_add(bytes);
         } else {
             state.buckets.push_back(RateBucket {
                 started_at: now,
@@ -71,7 +71,7 @@ impl RateTracker {
                 bytes,
             });
         }
-        state.window_sum += bytes;
+        state.window_sum = state.window_sum.saturating_add(bytes);
         trim_rate_buckets(state);
     }
 
@@ -184,12 +184,15 @@ impl EventLog {
         };
 
         match state.activities.entry(key.clone()) {
-            Entry::Occupied(mut entry) => *entry.get_mut() += bytes,
+            Entry::Occupied(mut entry) => {
+                *entry.get_mut() = entry.get().saturating_add(bytes);
+            }
             Entry::Vacant(entry) => {
-                *state
+                let count = state
                     .path_pid_counts
                     .entry(Arc::clone(&key.path))
-                    .or_default() += 1;
+                    .or_default();
+                *count = count.saturating_add(1);
                 entry.insert(bytes);
             }
         }
@@ -200,7 +203,8 @@ impl EventLog {
                 .is_some_and(|elapsed| elapsed < self.bucket_width)
         }) {
             bucket.latest_at = now;
-            *bucket.activities.entry(key).or_default() += bytes;
+            let total = bucket.activities.entry(key).or_default();
+            *total = total.saturating_add(bytes);
         } else {
             state.buckets.push_back(EventBucket {
                 started_at: now,
@@ -300,7 +304,7 @@ fn adjust_prefix_totals(totals: &mut HashMap<String, u64>, path: &str, bytes: u6
     for_each_path_prefix(path, |prefix| {
         if add {
             if let Some(total) = totals.get_mut(prefix) {
-                *total += bytes;
+                *total = total.saturating_add(bytes);
             } else {
                 totals.insert(prefix.to_string(), bytes);
             }

@@ -17,26 +17,29 @@ pub struct NodeStats {
 
 impl NodeStats {
     pub fn total_bytes(&self) -> u64 {
-        self.read_bytes + self.write_bytes
+        self.read_bytes.saturating_add(self.write_bytes)
     }
 
     pub fn total_ops(&self) -> u64 {
-        self.read_ops + self.write_ops + self.open_ops + self.close_ops
+        self.read_ops
+            .saturating_add(self.write_ops)
+            .saturating_add(self.open_ops)
+            .saturating_add(self.close_ops)
     }
 
     pub fn avg_latency_ns(&self) -> u64 {
-        let ops = self.read_ops + self.write_ops;
+        let ops = self.read_ops.saturating_add(self.write_ops);
         self.total_latency_ns.checked_div(ops).unwrap_or(0)
     }
 
     pub fn accumulate(&mut self, other: &NodeStats) {
-        self.read_bytes += other.read_bytes;
-        self.write_bytes += other.write_bytes;
-        self.read_ops += other.read_ops;
-        self.write_ops += other.write_ops;
-        self.open_ops += other.open_ops;
-        self.close_ops += other.close_ops;
-        self.total_latency_ns += other.total_latency_ns;
+        self.read_bytes = self.read_bytes.saturating_add(other.read_bytes);
+        self.write_bytes = self.write_bytes.saturating_add(other.write_bytes);
+        self.read_ops = self.read_ops.saturating_add(other.read_ops);
+        self.write_ops = self.write_ops.saturating_add(other.write_ops);
+        self.open_ops = self.open_ops.saturating_add(other.open_ops);
+        self.close_ops = self.close_ops.saturating_add(other.close_ops);
+        self.total_latency_ns = self.total_latency_ns.saturating_add(other.total_latency_ns);
         self.max_latency_ns = self.max_latency_ns.max(other.max_latency_ns);
     }
 
@@ -216,22 +219,22 @@ impl FileTree {
 fn apply_stats(stats: &mut NodeStats, op: OpKind, bytes: u64, latency_ns: u64) {
     match op {
         OpKind::Open => {
-            stats.open_ops += 1;
+            stats.open_ops = stats.open_ops.saturating_add(1);
         }
         OpKind::Read => {
-            stats.read_bytes += bytes;
-            stats.read_ops += 1;
-            stats.total_latency_ns += latency_ns;
+            stats.read_bytes = stats.read_bytes.saturating_add(bytes);
+            stats.read_ops = stats.read_ops.saturating_add(1);
+            stats.total_latency_ns = stats.total_latency_ns.saturating_add(latency_ns);
             stats.max_latency_ns = stats.max_latency_ns.max(latency_ns);
         }
         OpKind::Write => {
-            stats.write_bytes += bytes;
-            stats.write_ops += 1;
-            stats.total_latency_ns += latency_ns;
+            stats.write_bytes = stats.write_bytes.saturating_add(bytes);
+            stats.write_ops = stats.write_ops.saturating_add(1);
+            stats.total_latency_ns = stats.total_latency_ns.saturating_add(latency_ns);
             stats.max_latency_ns = stats.max_latency_ns.max(latency_ns);
         }
         OpKind::Close => {
-            stats.close_ops += 1;
+            stats.close_ops = stats.close_ops.saturating_add(1);
         }
     }
 }
