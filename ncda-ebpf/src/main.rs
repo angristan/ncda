@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel,
+        bpf_get_current_pid_tgid, bpf_get_current_task, bpf_ktime_get_ns, bpf_probe_read_kernel,
         bpf_probe_read_user_str_bytes,
     },
     macros::{map, raw_tracepoint},
@@ -35,6 +35,9 @@ mod arch {
     pub const ARG_REGISTERS: [usize; 3] = [14, 13, 12];
     // `orig_ax` in `struct pt_regs`.
     pub const SYSCALL_NUMBER_OFFSET: usize = 15 * core::mem::size_of::<u64>();
+    pub const X32_SYSCALL_BIT: i64 = 0x4000_0000;
+    pub const TASK_STATUS_OFFSET: usize = 2 * core::mem::size_of::<u64>();
+    pub const TS_COMPAT: u32 = 0x0002;
 }
 
 #[cfg(bpf_target_arch = "aarch64")]
@@ -61,6 +64,8 @@ mod arch {
     pub const ARG_REGISTERS: [usize; 3] = [0, 1, 2];
     // `syscallno` follows `user_pt_regs` and `orig_x0` in `struct pt_regs`.
     pub const SYSCALL_NUMBER_OFFSET: usize = 35 * core::mem::size_of::<u64>();
+    pub const PSTATE_OFFSET: usize = 33 * core::mem::size_of::<u64>();
+    pub const PSR_MODE32_BIT: u64 = 0x10;
 }
 
 #[cfg(not(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64")))]
@@ -108,6 +113,15 @@ fn record_scratch_failure() {
     if let Some(stats) = CAPTURE_STATS.get_ptr_mut(0) {
         unsafe {
             (*stats).scratch_failures = (*stats).scratch_failures.saturating_add(1);
+        };
+    }
+}
+
+#[inline(always)]
+fn record_compat_syscall() {
+    if let Some(stats) = CAPTURE_STATS.get_ptr_mut(0) {
+        unsafe {
+            (*stats).compat_syscalls_ignored = (*stats).compat_syscalls_ignored.saturating_add(1);
         };
     }
 }
@@ -162,6 +176,28 @@ unsafe fn syscall_number(registers: *const u64) -> i64 {
 }
 
 #[inline(always)]
+fn native_syscall_abi(_registers: *const u64, syscall: i64) -> bool {
+    #[cfg(bpf_target_arch = "x86_64")]
+    {
+        if syscall & arch::X32_SYSCALL_BIT != 0 {
+            return false;
+        }
+        let task = unsafe { bpf_get_current_task() } as *const u8;
+        let status =
+            unsafe { bpf_probe_read_kernel(task.add(arch::TASK_STATUS_OFFSET).cast::<u32>()) }
+                .unwrap_or(arch::TS_COMPAT);
+        status & arch::TS_COMPAT == 0
+    }
+    #[cfg(bpf_target_arch = "aarch64")]
+    {
+        let address = unsafe { _registers.cast::<u8>().add(arch::PSTATE_OFFSET) };
+        let pstate =
+            unsafe { bpf_probe_read_kernel(address.cast::<u64>()) }.unwrap_or(arch::PSR_MODE32_BIT);
+        pstate & arch::PSR_MODE32_BIT == 0
+    }
+}
+
+#[inline(always)]
 fn io_kind(syscall: i64) -> Option<u32> {
     match syscall {
         arch::READ | arch::PREAD64 | arch::READV | arch::PREADV | arch::PREADV2 => Some(EVENT_READ),
@@ -176,6 +212,10 @@ fn io_kind(syscall: i64) -> Option<u32> {
 pub fn sys_enter(ctx: RawTracePointContext) -> i32 {
     let syscall: i64 = ctx.arg(1);
     let registers = ctx.arg::<usize>(0) as *const u64;
+    if !native_syscall_abi(registers, syscall) {
+        record_compat_syscall();
+        return 0;
+    }
     let pid_tgid = bpf_get_current_pid_tgid();
 
     if syscall == arch::OPENAT || syscall == arch::OPENAT2 {

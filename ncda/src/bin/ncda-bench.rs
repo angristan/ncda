@@ -175,6 +175,7 @@ struct CaptureReport {
     write_entries: u64,
     read_exits: u64,
     write_exits: u64,
+    compat_syscalls_ignored: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -351,6 +352,7 @@ async fn main() -> Result<()> {
             write_entries: kernel.write_entries,
             read_exits: kernel.read_exits,
             write_exits: kernel.write_exits,
+            compat_syscalls_ignored: kernel.compat_syscalls_ignored,
         },
         drops: DropReport {
             kernel_ring: kernel.ring_output_drops,
@@ -524,6 +526,9 @@ fn subtract_capture_stats(end: CaptureStats, start: CaptureStats) -> CaptureStat
         write_entries: end.write_entries.saturating_sub(start.write_entries),
         read_exits: end.read_exits.saturating_sub(start.read_exits),
         write_exits: end.write_exits.saturating_sub(start.write_exits),
+        compat_syscalls_ignored: end
+            .compat_syscalls_ignored
+            .saturating_sub(start.compat_syscalls_ignored),
     }
 }
 

@@ -160,6 +160,7 @@ pub struct CaptureStats {
     pub write_entries: u64,
     pub read_exits: u64,
     pub write_exits: u64,
+    pub compat_syscalls_ignored: u64,
 }
 
 #[cfg(feature = "user")]
@@ -172,7 +173,7 @@ const _: [(); 40] = [(); core::mem::size_of::<IoEvent>()];
 const _: [(); 32] = [(); core::mem::size_of::<FdEvent>()];
 const _: [(); 32] = [(); core::mem::size_of::<RangeEvent>()];
 const _: [(); 16] = [(); core::mem::size_of::<ProcessEvent>()];
-const _: [(); 56] = [(); core::mem::size_of::<CaptureStats>()];
+const _: [(); 64] = [(); core::mem::size_of::<CaptureStats>()];
 
 #[cfg(test)]
 mod tests {

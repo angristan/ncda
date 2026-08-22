@@ -138,6 +138,9 @@ pub fn capture_stats(map: &PerCpuArray<MapData, CaptureStats>) -> Result<Capture
             total.write_entries = total.write_entries.saturating_add(value.write_entries);
             total.read_exits = total.read_exits.saturating_add(value.read_exits);
             total.write_exits = total.write_exits.saturating_add(value.write_exits);
+            total.compat_syscalls_ignored = total
+                .compat_syscalls_ignored
+                .saturating_add(value.compat_syscalls_ignored);
             total
         }))
 }
@@ -734,7 +737,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<FdEvent>(), 32);
         assert_eq!(core::mem::size_of::<RangeEvent>(), 32);
         assert_eq!(core::mem::size_of::<ProcessEvent>(), 16);
-        assert_eq!(core::mem::size_of::<CaptureStats>(), 56);
+        assert_eq!(core::mem::size_of::<CaptureStats>(), 64);
     }
 
     #[test]
