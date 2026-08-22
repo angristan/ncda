@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use aya::maps::{PerCpuArray, RingBuf};
-use aya::Ebpf;
+use aya::{Ebpf, EbpfLoader};
 use ncda::bpf::{self, BpfEvent, ReaderDropCounters};
 use tokio::sync::{mpsc, watch};
 
@@ -418,6 +418,52 @@ async fn captures_extended_fd_lifecycle_without_loss() {
     assert_eq!(userspace.parse_drops, 0);
     assert_eq!(userspace.queue_drops, 0);
     assert_eq!(userspace.shutdown_discarded, 0);
+}
+
+#[test]
+#[ignore = "requires root and live eBPF support"]
+fn reports_induced_ring_loss() {
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run with scripts/test-ebpf.sh"
+    );
+    raise_memlock_limit();
+
+    let mut loader = EbpfLoader::new();
+    loader.map_max_entries("EVENTS", 4096);
+    let mut ebpf = loader
+        .load(aya::include_bytes_aligned!(concat!(
+            env!("OUT_DIR"),
+            "/ncda"
+        )))
+        .unwrap();
+    let process_exit_hook = bpf::load_programs(&mut ebpf).unwrap();
+    let capture_stats = ebpf.take_map("CAPTURE_STATS").unwrap();
+    let capture_stats =
+        PerCpuArray::<_, ncda_common::CaptureStats>::try_from(capture_stats).unwrap();
+    let attached = bpf::attach_programs(&mut ebpf, process_exit_hook).unwrap();
+
+    let fixture = Fixture::new();
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(fixture.root.join("overflow.dat"))
+        .unwrap();
+    for _ in 0..10_000 {
+        assert_eq!(
+            unsafe { libc::write(file.as_raw_fd(), DATA.as_ptr().cast(), DATA.len()) },
+            DATA.len() as isize
+        );
+    }
+
+    let kernel = bpf::capture_stats(&capture_stats).unwrap();
+    attached.detach(&mut ebpf).unwrap();
+    assert!(
+        kernel.ring_output_drops > 0,
+        "the deliberately undrained 4 KiB ring did not overflow"
+    );
 }
 
 fn compile_leader_exit_helper(root: &std::path::Path) -> PathBuf {
