@@ -242,7 +242,7 @@ async fn main() -> Result<()> {
         env!("OUT_DIR"),
         "/ncda"
     )))?;
-    bpf::load_and_attach(&mut ebpf)?;
+    bpf::load_programs(&mut ebpf)?;
 
     let events = ebpf.take_map("EVENTS").context("EVENTS map not found")?;
     let ring_buf = RingBuf::try_from(events)?;
@@ -269,6 +269,7 @@ async fn main() -> Result<()> {
         measurement_start.clone(),
         measurement_end.clone(),
     ));
+    let attached = bpf::attach_programs(&mut ebpf)?;
 
     if cli.warmup_seconds > 0 {
         run_workload_async(
@@ -297,6 +298,7 @@ async fn main() -> Result<()> {
     let kernel = subtract_capture_stats(bpf::capture_stats(&capture_stats)?, kernel_start);
 
     tokio::time::sleep(Duration::from_millis(cli.drain_ms)).await;
+    attached.detach(&mut ebpf)?;
     drop(ebpf);
     let _ = shutdown_tx.send(true);
     reader_handle.await.context("reader task panicked")??;

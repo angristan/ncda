@@ -70,7 +70,7 @@ async fn captures_extended_fd_lifecycle_without_loss() {
         "/ncda"
     )))
     .unwrap();
-    bpf::load_and_attach(&mut ebpf).unwrap();
+    bpf::load_programs(&mut ebpf).unwrap();
 
     let events = ebpf.take_map("EVENTS").unwrap();
     let ring_buf = RingBuf::try_from(events).unwrap();
@@ -93,6 +93,7 @@ async fn captures_extended_fd_lifecycle_without_loss() {
         }
         events
     });
+    let attached = bpf::attach_programs(&mut ebpf).unwrap();
 
     let relative_name = CString::new("lifecycle.dat").unwrap();
     let fd = unsafe {
@@ -247,6 +248,7 @@ async fn captures_extended_fd_lifecycle_without_loss() {
     }
 
     // Detach immediately: reader_loop's final drain must preserve all records.
+    attached.detach(&mut ebpf).unwrap();
     drop(ebpf);
     shutdown_tx.send(true).unwrap();
     reader.await.unwrap().unwrap();

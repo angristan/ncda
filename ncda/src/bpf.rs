@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use aya::maps::{MapData, PerCpuArray, RingBuf};
+use aya::programs::raw_trace_point::RawTracePointLinkId;
 use aya::programs::RawTracePoint;
 use aya::Ebpf;
 use log::{debug, info};
@@ -140,24 +141,61 @@ pub fn capture_stats(map: &PerCpuArray<MapData, CaptureStats>) -> Result<Capture
         }))
 }
 
-/// Load and globally attach the architecture-specific raw syscall decoder.
-pub fn load_and_attach(ebpf: &mut Ebpf) -> Result<()> {
-    for (program_name, tracepoint_name) in [
-        ("sys_enter", "sys_enter"),
-        ("sys_exit", "sys_exit"),
-        ("sched_process_exec", "sched_process_exec"),
-        ("sched_process_exit", "sched_process_exit"),
-    ] {
-        let program: &mut RawTracePoint = ebpf
-            .program_mut(program_name)
-            .with_context(|| format!("program {program_name} not found"))?
-            .try_into()
-            .with_context(|| format!("failed to get program {program_name}"))?;
-        program.load()?;
-        program.attach(tracepoint_name)?;
-        info!("attached {program_name} to raw tracepoint {tracepoint_name}");
+const RAW_PROGRAMS: [(&str, &str); 4] = [
+    ("sys_exit", "sys_exit"),
+    ("sched_process_exit", "sched_process_exit"),
+    ("sched_process_exec", "sched_process_exec"),
+    // Entry must attach last so every new stash has an active exit consumer.
+    ("sys_enter", "sys_enter"),
+];
+
+pub struct AttachedPrograms {
+    links: Vec<(&'static str, RawTracePointLinkId)>,
+}
+
+impl AttachedPrograms {
+    /// Stop entry producers first, then detach lifecycle and exit consumers.
+    pub fn detach(mut self, ebpf: &mut Ebpf) -> Result<()> {
+        self.links.reverse();
+        for (program_name, link) in self.links {
+            raw_program_mut(ebpf, program_name)?
+                .detach(link)
+                .with_context(|| format!("detach {program_name}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Verify and load all programs before any global hook becomes active.
+pub fn load_programs(ebpf: &mut Ebpf) -> Result<()> {
+    for (program_name, _) in RAW_PROGRAMS {
+        raw_program_mut(ebpf, program_name)?
+            .load()
+            .with_context(|| format!("load program {program_name}"))?;
     }
     Ok(())
+}
+
+/// Attach exit consumers before the syscall-entry producer.
+pub fn attach_programs(ebpf: &mut Ebpf) -> Result<AttachedPrograms> {
+    let mut links = Vec::with_capacity(RAW_PROGRAMS.len());
+    for (program_name, tracepoint_name) in RAW_PROGRAMS {
+        let link = raw_program_mut(ebpf, program_name)?
+            .attach(tracepoint_name)
+            .with_context(|| {
+                format!("attach program {program_name} to raw tracepoint {tracepoint_name}")
+            })?;
+        links.push((program_name, link));
+        info!("attached {program_name} to raw tracepoint {tracepoint_name}");
+    }
+    Ok(AttachedPrograms { links })
+}
+
+fn raw_program_mut<'a>(ebpf: &'a mut Ebpf, name: &str) -> Result<&'a mut RawTracePoint> {
+    ebpf.program_mut(name)
+        .with_context(|| format!("program {name} not found"))?
+        .try_into()
+        .with_context(|| format!("program {name} has unexpected type"))
 }
 
 const MAX_BATCH_EVENTS: usize = 4096;

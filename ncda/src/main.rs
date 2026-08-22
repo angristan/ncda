@@ -73,9 +73,7 @@ async fn main() -> Result<()> {
     .map_err(anyhow::Error::from)
     .map_err(add_ebpf_permission_hint)?;
 
-    // Attach tracepoints.
-    bpf::load_and_attach(&mut ebpf).map_err(add_ebpf_permission_hint)?;
-    info!("all eBPF programs attached");
+    bpf::load_programs(&mut ebpf).map_err(add_ebpf_permission_hint)?;
 
     // Own both maps independently so dropping `ebpf` detaches all producers
     // before the reader's final drain.
@@ -107,6 +105,11 @@ async fn main() -> Result<()> {
         reader_shutdown_rx,
         reader_drops.clone(),
     ));
+
+    // The reader is ready before global producers become active. Exit hooks
+    // attach before sys_enter so no entry can outlive its consumer.
+    let attached = bpf::attach_programs(&mut ebpf).map_err(add_ebpf_permission_hint)?;
+    info!("all eBPF programs attached");
 
     let discard_pending = Arc::new(AtomicBool::new(false));
     let agg_discard_pending = Arc::clone(&discard_pending);
@@ -145,6 +148,9 @@ async fn main() -> Result<()> {
     let shutdown_started = Instant::now();
     discard_pending.store(true, Ordering::Release);
     let _ = container_shutdown_tx.send(true);
+    if let Err(error) = attached.detach(&mut ebpf) {
+        warn!("ordered eBPF detach failed: {error:#}");
+    }
     drop(ebpf);
     let _ = reader_shutdown_tx.send(true);
     reader_handle.await.context("BPF reader task panicked")??;
