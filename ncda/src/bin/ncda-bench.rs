@@ -243,7 +243,7 @@ async fn main() -> Result<()> {
         env!("OUT_DIR"),
         "/ncda"
     )))?;
-    bpf::load_programs(&mut ebpf)?;
+    let process_exit_hook = bpf::load_programs(&mut ebpf)?;
 
     let events = ebpf.take_map("EVENTS").context("EVENTS map not found")?;
     let ring_buf = RingBuf::try_from(events)?;
@@ -270,7 +270,7 @@ async fn main() -> Result<()> {
         measurement_start.clone(),
         measurement_end.clone(),
     ));
-    let attached = bpf::attach_programs(&mut ebpf)?;
+    let attached = bpf::attach_programs(&mut ebpf, process_exit_hook)?;
 
     if cli.warmup_seconds > 0 {
         run_workload_async(

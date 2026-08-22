@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
     .map_err(anyhow::Error::from)
     .map_err(add_ebpf_permission_hint)?;
 
-    bpf::load_programs(&mut ebpf).map_err(add_ebpf_permission_hint)?;
+    let process_exit_hook = bpf::load_programs(&mut ebpf).map_err(add_ebpf_permission_hint)?;
 
     // Own both maps independently so dropping `ebpf` detaches all producers
     // before the reader's final drain.
@@ -108,7 +108,8 @@ async fn main() -> Result<()> {
 
     // The reader is ready before global producers become active. Exit hooks
     // attach before sys_enter so no entry can outlive its consumer.
-    let attached = bpf::attach_programs(&mut ebpf).map_err(add_ebpf_permission_hint)?;
+    let attached =
+        bpf::attach_programs(&mut ebpf, process_exit_hook).map_err(add_ebpf_permission_hint)?;
     info!("all eBPF programs attached");
 
     let discard_pending = Arc::new(AtomicBool::new(false));

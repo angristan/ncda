@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use aya::maps::{MapData, PerCpuArray, RingBuf};
+use aya::programs::kprobe::KProbeLinkId;
 use aya::programs::raw_trace_point::RawTracePointLinkId;
-use aya::programs::RawTracePoint;
+use aya::programs::{KProbe, RawTracePoint};
 use aya::Ebpf;
 use log::{debug, info};
 use tokio::io::unix::AsyncFd;
@@ -145,57 +146,153 @@ pub fn capture_stats(map: &PerCpuArray<MapData, CaptureStats>) -> Result<Capture
         }))
 }
 
-const RAW_PROGRAMS: [(&str, &str); 4] = [
+const BASE_RAW_PROGRAMS: [(&str, &str); 3] = [
     ("sys_exit", "sys_exit"),
-    ("sched_process_exit", "sched_process_exit"),
     ("sched_process_exec", "sched_process_exec"),
     // Entry must attach last so every new stash has an active exit consumer.
     ("sys_enter", "sys_enter"),
 ];
+const TASKSTATS_EXIT: &str = "taskstats_process_exit";
+
+#[derive(Debug, Clone, Copy)]
+pub enum ProcessExitHook {
+    Tracepoint,
+    TaskstatsKprobe,
+}
+
+pub enum AttachedLink {
+    Raw(&'static str, RawTracePointLinkId),
+    KProbe(&'static str, KProbeLinkId),
+}
 
 pub struct AttachedPrograms {
-    links: Vec<(&'static str, RawTracePointLinkId)>,
+    links: Vec<AttachedLink>,
 }
 
 impl AttachedPrograms {
     /// Stop entry producers first, then detach lifecycle and exit consumers.
     pub fn detach(mut self, ebpf: &mut Ebpf) -> Result<()> {
         self.links.reverse();
-        for (program_name, link) in self.links {
-            raw_program_mut(ebpf, program_name)?
-                .detach(link)
-                .with_context(|| format!("detach {program_name}"))?;
+        for link in self.links {
+            match link {
+                AttachedLink::Raw(program_name, link) => raw_program_mut(ebpf, program_name)?
+                    .detach(link)
+                    .with_context(|| format!("detach {program_name}"))?,
+                AttachedLink::KProbe(program_name, link) => kprobe_program_mut(ebpf, program_name)?
+                    .detach(link)
+                    .with_context(|| format!("detach {program_name}"))?,
+            }
         }
         Ok(())
     }
 }
 
+fn tracepoint_has_group_dead(format: &str) -> bool {
+    format.lines().any(|line| {
+        line.contains("field:")
+            && line.split_whitespace().any(|field| {
+                field
+                    .trim_end_matches(';')
+                    .trim_end_matches(']')
+                    .trim_start_matches('*')
+                    == "group_dead"
+            })
+    })
+}
+
+fn process_exit_hook() -> ProcessExitHook {
+    let format =
+        std::fs::read_to_string("/sys/kernel/tracing/events/sched/sched_process_exit/format")
+            .or_else(|_| {
+                std::fs::read_to_string(
+                    "/sys/kernel/debug/tracing/events/sched/sched_process_exit/format",
+                )
+            });
+    if format.as_deref().is_ok_and(tracepoint_has_group_dead) {
+        ProcessExitHook::Tracepoint
+    } else {
+        ProcessExitHook::TaskstatsKprobe
+    }
+}
+
 /// Verify and load all programs before any global hook becomes active.
-pub fn load_programs(ebpf: &mut Ebpf) -> Result<()> {
-    for (program_name, _) in RAW_PROGRAMS {
+pub fn load_programs(ebpf: &mut Ebpf) -> Result<ProcessExitHook> {
+    for (program_name, _) in BASE_RAW_PROGRAMS {
         raw_program_mut(ebpf, program_name)?
             .load()
             .with_context(|| format!("load program {program_name}"))?;
     }
-    Ok(())
+    let hook = process_exit_hook();
+    match hook {
+        ProcessExitHook::Tracepoint => raw_program_mut(ebpf, "sched_process_exit_group")?
+            .load()
+            .context("load group-dead process exit tracepoint")?,
+        ProcessExitHook::TaskstatsKprobe => {
+            raw_program_mut(ebpf, "sched_process_exit_legacy")?
+                .load()
+                .context("load legacy process exit tracepoint")?;
+            kprobe_program_mut(ebpf, TASKSTATS_EXIT)?
+                .load()
+                .context("load taskstats process exit kprobe")?;
+        }
+    }
+    Ok(hook)
 }
 
 /// Attach exit consumers before the syscall-entry producer.
-pub fn attach_programs(ebpf: &mut Ebpf) -> Result<AttachedPrograms> {
-    let mut links = Vec::with_capacity(RAW_PROGRAMS.len());
-    for (program_name, tracepoint_name) in RAW_PROGRAMS {
-        let link = raw_program_mut(ebpf, program_name)?
-            .attach(tracepoint_name)
-            .with_context(|| {
-                format!("attach program {program_name} to raw tracepoint {tracepoint_name}")
-            })?;
-        links.push((program_name, link));
-        info!("attached {program_name} to raw tracepoint {tracepoint_name}");
+pub fn attach_programs(ebpf: &mut Ebpf, hook: ProcessExitHook) -> Result<AttachedPrograms> {
+    let mut links = Vec::with_capacity(5);
+    attach_raw(ebpf, &mut links, "sys_exit", "sys_exit")?;
+    match hook {
+        ProcessExitHook::Tracepoint => attach_raw(
+            ebpf,
+            &mut links,
+            "sched_process_exit_group",
+            "sched_process_exit",
+        )?,
+        ProcessExitHook::TaskstatsKprobe => {
+            attach_raw(
+                ebpf,
+                &mut links,
+                "sched_process_exit_legacy",
+                "sched_process_exit",
+            )?;
+            let link = kprobe_program_mut(ebpf, TASKSTATS_EXIT)?
+                .attach("taskstats_exit", 0)
+                .context("attach taskstats_exit process-lifecycle fallback; this kernel needs CONFIG_TASKSTATS")?;
+            links.push(AttachedLink::KProbe(TASKSTATS_EXIT, link));
+            info!("attached {TASKSTATS_EXIT} to kprobe taskstats_exit");
+        }
     }
+    attach_raw(ebpf, &mut links, "sched_process_exec", "sched_process_exec")?;
+    attach_raw(ebpf, &mut links, "sys_enter", "sys_enter")?;
     Ok(AttachedPrograms { links })
 }
 
+fn attach_raw(
+    ebpf: &mut Ebpf,
+    links: &mut Vec<AttachedLink>,
+    program_name: &'static str,
+    tracepoint_name: &str,
+) -> Result<()> {
+    let link = raw_program_mut(ebpf, program_name)?
+        .attach(tracepoint_name)
+        .with_context(|| {
+            format!("attach program {program_name} to raw tracepoint {tracepoint_name}")
+        })?;
+    links.push(AttachedLink::Raw(program_name, link));
+    info!("attached {program_name} to raw tracepoint {tracepoint_name}");
+    Ok(())
+}
+
 fn raw_program_mut<'a>(ebpf: &'a mut Ebpf, name: &str) -> Result<&'a mut RawTracePoint> {
+    ebpf.program_mut(name)
+        .with_context(|| format!("program {name} not found"))?
+        .try_into()
+        .with_context(|| format!("program {name} has unexpected type"))
+}
+
+fn kprobe_program_mut<'a>(ebpf: &'a mut Ebpf, name: &str) -> Result<&'a mut KProbe> {
     ebpf.program_mut(name)
         .with_context(|| format!("program {name} not found"))?
         .try_into()
@@ -729,6 +826,17 @@ fn push_display_text(output: &mut String, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_exit_tracepoint_detection_checks_fields() {
+        let legacy = "field:pid_t pid;\toffset:24;\tsize:4;\tsigned:1;";
+        let current = concat!(
+            "field:pid_t pid;\toffset:24;\tsize:4;\tsigned:1;\n",
+            "field:bool group_dead;\toffset:32;\tsize:1;\tsigned:0;"
+        );
+        assert!(!tracepoint_has_group_dead(legacy));
+        assert!(tracepoint_has_group_dead(current));
+    }
 
     #[test]
     fn shared_event_abi_has_expected_sizes() {

@@ -6,9 +6,9 @@ use aya_ebpf::{
         bpf_get_current_pid_tgid, bpf_get_current_task, bpf_ktime_get_ns, bpf_probe_read_kernel,
         bpf_probe_read_user_str_bytes,
     },
-    macros::{map, raw_tracepoint},
+    macros::{kprobe, map, raw_tracepoint},
     maps::{HashMap, PerCpuArray, RingBuf},
-    programs::RawTracePointContext,
+    programs::{ProbeContext, RawTracePointContext},
 };
 use ncda_common::*;
 
@@ -486,6 +486,18 @@ fn clear_stashes(pid_tgid: u64) {
 
 #[inline(always)]
 fn emit_process_event(kind: u32, pid_tgid: u64) {
+    let event = ProcessEvent {
+        kind,
+        pid: (pid_tgid >> 32) as u32,
+        emitted_ns: unsafe { bpf_ktime_get_ns() },
+    };
+    if EVENTS.output::<ProcessEvent>(&event, 0).is_err() {
+        record_ring_drop();
+    }
+}
+
+#[inline(always)]
+fn emit_leader_process_event(kind: u32, pid_tgid: u64) {
     let pid = (pid_tgid >> 32) as u32;
     let tid = pid_tgid as u32;
     if pid != tid {
@@ -503,17 +515,36 @@ fn emit_process_event(kind: u32, pid_tgid: u64) {
 
 #[raw_tracepoint(tracepoint = "sched_process_exec")]
 pub fn sched_process_exec(_ctx: RawTracePointContext) -> i32 {
-    emit_process_event(EVENT_PROCESS_EXEC, bpf_get_current_pid_tgid());
+    emit_leader_process_event(EVENT_PROCESS_EXEC, bpf_get_current_pid_tgid());
     0
 }
 
+/// Linux 6.1 compatibility hook. A companion taskstats kprobe emits the
+/// process event when the kernel reports `group_dead`.
 #[raw_tracepoint(tracepoint = "sched_process_exit")]
-pub fn sched_process_exit(_ctx: RawTracePointContext) -> i32 {
+pub fn sched_process_exit_legacy(_ctx: RawTracePointContext) -> i32 {
+    clear_stashes(bpf_get_current_pid_tgid());
+    0
+}
+
+/// New kernels expose `group_dead` directly on sched_process_exit.
+#[raw_tracepoint(tracepoint = "sched_process_exit")]
+pub fn sched_process_exit_group(ctx: RawTracePointContext) -> i32 {
     let pid_tgid = bpf_get_current_pid_tgid();
-    // A task can terminate without returning through sys_exit. Always clear
-    // thread-scoped correlation state, even when this is not the group leader.
     clear_stashes(pid_tgid);
-    emit_process_event(EVENT_PROCESS_EXIT, pid_tgid);
+    let group_dead: u64 = ctx.arg(1);
+    if group_dead != 0 {
+        emit_process_event(EVENT_PROCESS_EXIT, pid_tgid);
+    }
+    0
+}
+
+/// Fallback for kernels whose sched_process_exit tracepoint lacks group_dead.
+#[kprobe(function = "taskstats_exit")]
+pub fn taskstats_process_exit(ctx: ProbeContext) -> u32 {
+    if ctx.arg::<i32>(1).unwrap_or(0) != 0 {
+        emit_process_event(EVENT_PROCESS_EXIT, bpf_get_current_pid_tgid());
+    }
     0
 }
 
