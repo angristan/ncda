@@ -1,3 +1,26 @@
+## [1.0.4](https://github.com/angristan/ncda/compare/v1.0.3...v1.0.4) (2026-08-22)
+
+
+### Bug Fixes
+
+* arm termination signals before probes ([c16b6d4](https://github.com/angristan/ncda/commit/c16b6d4f1581a6bbf854431c0a977937cf27631c))
+* clean process state after final thread ([380a4b5](https://github.com/angristan/ncda/commit/380a4b5b3943ba34f2568808f317a4d1fdfb0c0c))
+* explain eBPF startup failures ([1a8aff5](https://github.com/angristan/ncda/commit/1a8aff5c50945b170940b6bc1c6903900fc649c0))
+* finish cleanup after runtime failures ([0344162](https://github.com/angristan/ncda/commit/0344162fb7c48b294d46bc5805281abf1d4f4eb5))
+* ignore unsupported compatibility syscalls ([fdc3861](https://github.com/angristan/ncda/commit/fdc38614f3d10a1406a6b905a4b734b8ef45de51))
+* invalidate attribution state after loss ([cd0b43b](https://github.com/angristan/ncda/commit/cd0b43b153c722c65a890b3f0e6a2ec6164f2a45))
+* order BPF attachment and teardown ([a647287](https://github.com/angristan/ncda/commit/a647287f47182099cc2aa8fe901d30ff13100ae1))
+* preserve exact pathname identity ([9d7c6e3](https://github.com/angristan/ncda/commit/9d7c6e3edd37f2f16ff69cb5ce90c5c03feaa3e1))
+* preserve Linux descriptor lifecycle semantics ([444e56d](https://github.com/angristan/ncda/commit/444e56d993fe03f85adbdca3fb7aab5e823acf5d))
+* reject compatibility syscall exits ([931c36e](https://github.com/angristan/ncda/commit/931c36e5c7a4b93c5abe21a9291e582d5e49cd50))
+* report path resolution capability ([d6b44bb](https://github.com/angristan/ncda/commit/d6b44bbbfff891bcee5e676caa08e539e0b5a207))
+* supervise capture runtime tasks ([dab78e6](https://github.com/angristan/ncda/commit/dab78e6e1f45d6d571c44d47079749b5215a7509))
+
+
+### Performance Improvements
+
+* dispatch syscall exits directly ([dbe2826](https://github.com/angristan/ncda/commit/dbe2826e3a8468b9a296b070ae0d1eac3f0467b8))
+
 ## [1.0.3](https://github.com/angristan/ncda/compare/v1.0.2...v1.0.3) (2026-08-21)
 
 
