@@ -33,6 +33,8 @@ mod arch {
     pub const OPENAT: i64 = 257;
     pub const OPENAT2: i64 = 437;
     pub const ARG_REGISTERS: [usize; 3] = [14, 13, 12];
+    // `orig_ax` in `struct pt_regs`.
+    pub const SYSCALL_NUMBER_OFFSET: usize = 15 * core::mem::size_of::<u64>();
 }
 
 #[cfg(bpf_target_arch = "aarch64")]
@@ -57,6 +59,8 @@ mod arch {
     pub const OPENAT: i64 = 56;
     pub const OPENAT2: i64 = 437;
     pub const ARG_REGISTERS: [usize; 3] = [0, 1, 2];
+    // `syscallno` follows `user_pt_regs` and `orig_x0` in `struct pt_regs`.
+    pub const SYSCALL_NUMBER_OFFSET: usize = 35 * core::mem::size_of::<u64>();
 }
 
 #[cfg(not(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64")))]
@@ -138,6 +142,23 @@ fn record_io_exit(kind: u32) {
 unsafe fn syscall_arg(registers: *const u64, argument: usize) -> u64 {
     let index = arch::ARG_REGISTERS[argument];
     unsafe { bpf_probe_read_kernel(registers.add(index)) }.unwrap_or(0)
+}
+
+#[inline(always)]
+unsafe fn syscall_number(registers: *const u64) -> i64 {
+    let address = unsafe { registers.cast::<u8>().add(arch::SYSCALL_NUMBER_OFFSET) };
+    #[cfg(bpf_target_arch = "x86_64")]
+    {
+        unsafe { bpf_probe_read_kernel(address.cast::<u64>()) }
+            .map(|number| number as i64)
+            .unwrap_or(-1)
+    }
+    #[cfg(bpf_target_arch = "aarch64")]
+    {
+        unsafe { bpf_probe_read_kernel(address.cast::<i32>()) }
+            .map(i64::from)
+            .unwrap_or(-1)
+    }
 }
 
 #[inline(always)]
@@ -246,38 +267,52 @@ fn enter_close_range(registers: *const u64, pid_tgid: u64) {
 #[raw_tracepoint(tracepoint = "sys_exit")]
 pub fn sys_exit(ctx: RawTracePointContext) -> i32 {
     let pid_tgid = bpf_get_current_pid_tgid();
+    let registers = ctx.arg::<usize>(0) as *const u64;
+    let syscall = unsafe { syscall_number(registers) };
     let result: i64 = ctx.arg(1);
 
-    if let Some(args) = unsafe { OPEN_STASH.get(&pid_tgid) } {
-        exit_open(pid_tgid, result, args);
-        let _ = OPEN_STASH.remove(&pid_tgid);
-    } else if let Some(args) = unsafe { IO_STASH.get(&pid_tgid) } {
-        let args = RwArgs {
-            ts: args.ts,
-            fd: args.fd,
-            kind: args.kind,
-        };
-        let _ = IO_STASH.remove(&pid_tgid);
-        exit_io(pid_tgid, result, &args);
-    } else if let Some(args) = unsafe { CLOSE_STASH.get(&pid_tgid) } {
-        let fd = args.fd;
-        let _ = CLOSE_STASH.remove(&pid_tgid);
-        exit_close(pid_tgid, result, fd);
-    } else if let Some(args) = unsafe { DUP_STASH.get(&pid_tgid) } {
-        let old_fd = args.fd;
-        let _ = DUP_STASH.remove(&pid_tgid);
-        exit_dup(pid_tgid, result, old_fd);
-    } else if let Some(args) = unsafe { RANGE_STASH.get(&pid_tgid) } {
-        let args = RangeArgs {
-            first_fd: args.first_fd,
-            last_fd: args.last_fd,
-            flags: args.flags,
-            _pad: 0,
-        };
-        let _ = RANGE_STASH.remove(&pid_tgid);
-        exit_close_range(pid_tgid, result, &args);
-    } else {
-        // Untracked syscalls intentionally have no stash entry.
+    if syscall == arch::OPENAT || syscall == arch::OPENAT2 {
+        if let Some(args) = unsafe { OPEN_STASH.get(&pid_tgid) } {
+            exit_open(pid_tgid, result, args);
+            let _ = OPEN_STASH.remove(&pid_tgid);
+        }
+    } else if io_kind(syscall).is_some() {
+        if let Some(args) = unsafe { IO_STASH.get(&pid_tgid) } {
+            let args = RwArgs {
+                ts: args.ts,
+                fd: args.fd,
+                kind: args.kind,
+            };
+            let _ = IO_STASH.remove(&pid_tgid);
+            exit_io(pid_tgid, result, &args);
+        }
+    } else if syscall == arch::CLOSE {
+        if let Some(args) = unsafe { CLOSE_STASH.get(&pid_tgid) } {
+            let fd = args.fd;
+            let _ = CLOSE_STASH.remove(&pid_tgid);
+            exit_close(pid_tgid, result, fd);
+        }
+    } else if syscall == arch::DUP
+        || syscall == arch::DUP2
+        || syscall == arch::DUP3
+        || syscall == arch::FCNTL
+    {
+        if let Some(args) = unsafe { DUP_STASH.get(&pid_tgid) } {
+            let old_fd = args.fd;
+            let _ = DUP_STASH.remove(&pid_tgid);
+            exit_dup(pid_tgid, result, old_fd);
+        }
+    } else if syscall == arch::CLOSE_RANGE {
+        if let Some(args) = unsafe { RANGE_STASH.get(&pid_tgid) } {
+            let args = RangeArgs {
+                first_fd: args.first_fd,
+                last_fd: args.last_fd,
+                flags: args.flags,
+                _pad: 0,
+            };
+            let _ = RANGE_STASH.remove(&pid_tgid);
+            exit_close_range(pid_tgid, result, &args);
+        }
     }
     0
 }
