@@ -848,6 +848,26 @@ mod tests {
         assert_eq!(core::mem::size_of::<CaptureStats>(), 64);
     }
 
+    #[tokio::test]
+    async fn closed_queue_accounts_for_the_entire_batch() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let counters = ReaderDropCounters::default();
+        let batch = vec![
+            BpfEvent::ProcessExit {
+                pid: 1,
+                emitted_ns: 1,
+            },
+            BpfEvent::ProcessExit {
+                pid: 2,
+                emitted_ns: 2,
+            },
+        ];
+
+        assert!(!send_batch(&tx, batch, &counters).await);
+        assert_eq!(counters.snapshot().queue_drops, 2);
+    }
+
     #[test]
     fn reader_drop_snapshot_tracks_each_loss_class() {
         let counters = ReaderDropCounters::default();

@@ -4,7 +4,9 @@ use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 
 use aya::maps::{PerCpuArray, RingBuf};
@@ -50,6 +52,15 @@ async fn captures_extended_fd_lifecycle_without_loss() {
     raise_memlock_limit();
 
     let fixture = Fixture::new();
+    let leader_exit_helper = compile_leader_exit_helper(&fixture.root);
+    let leader_exit_path = fixture.root.join("leader-exit.dat");
+    let long_directory = fixture.root.join("a".repeat(180)).join("b".repeat(80));
+    std::fs::create_dir_all(&long_directory).unwrap();
+    let long_path = long_directory.join("long.dat");
+    assert!(long_path.as_os_str().as_bytes().len() > ncda_common::MAX_FNAME_LEN);
+    let invalid_path = fixture
+        .root
+        .join(std::ffi::OsString::from_vec(b"invalid-\xff.dat".to_vec()));
     let directory = std::fs::File::open(&fixture.root).unwrap();
     let preexisting_path = fixture.root.join("preexisting.dat");
     let preexisting_file = OpenOptions::new()
@@ -94,6 +105,29 @@ async fn captures_extended_fd_lifecycle_without_loss() {
         events
     });
     let attached = bpf::attach_programs(&mut ebpf, process_exit_hook).unwrap();
+
+    let leader_child = Command::new(&leader_exit_helper)
+        .arg(&leader_exit_path)
+        .spawn()
+        .unwrap();
+    let leader_child_pid = leader_child.id();
+    assert!(leader_child.wait_with_output().unwrap().status.success());
+
+    let invalid_file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&invalid_path)
+        .unwrap();
+    drop(invalid_file);
+
+    let long_file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&long_path)
+        .unwrap();
+    drop(long_file);
 
     let relative_name = CString::new("lifecycle.dat").unwrap();
     let fd = unsafe {
@@ -254,7 +288,45 @@ async fn captures_extended_fd_lifecycle_without_loss() {
     reader.await.unwrap().unwrap();
     let events = collector.await.unwrap();
 
+    let leader_path_bytes = leader_exit_path.as_os_str().as_bytes();
+    let leader_open = events.iter().position(|event| {
+        matches!(event, BpfEvent::Open { pid, path, .. }
+            if *pid == leader_child_pid && path.as_slice() == leader_path_bytes)
+    });
+    let leader_open = leader_open.expect("surviving worker open was not captured");
+    let leader_fd = match &events[leader_open] {
+        BpfEvent::Open { fd, .. } => *fd,
+        _ => unreachable!(),
+    };
+    let leader_write = events.iter().position(|event| {
+        matches!(event, BpfEvent::Write { pid, fd, bytes, .. }
+            if *pid == leader_child_pid && *fd == leader_fd && *bytes == DATA.len() as u64)
+    });
+    let leader_write = leader_write.expect("surviving worker write was not captured");
+    let leader_exits = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            matches!(event, BpfEvent::ProcessExit { pid, .. } if *pid == leader_child_pid)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(leader_exits.len(), 1);
+    assert!(leader_open < leader_write && leader_write < leader_exits[0]);
+
     let pid = std::process::id();
+    assert!(events.iter().any(|event| {
+        matches!(event, BpfEvent::Open { pid: event_pid, path, path_flags: 0, .. }
+            if *event_pid == pid && path.as_slice() == invalid_path.as_os_str().as_bytes())
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(event, BpfEvent::Open { pid: event_pid, path, path_flags, .. }
+            if *event_pid == pid
+                && *path_flags == ncda_common::PATH_TRUNCATED
+                && path.len() == ncda_common::MAX_FNAME_LEN
+                && long_path.as_os_str().as_bytes().starts_with(path))
+    }));
+
     let opens = events
         .iter()
         .filter(|event| {
@@ -346,6 +418,47 @@ async fn captures_extended_fd_lifecycle_without_loss() {
     assert_eq!(userspace.parse_drops, 0);
     assert_eq!(userspace.queue_drops, 0);
     assert_eq!(userspace.shutdown_discarded, 0);
+}
+
+fn compile_leader_exit_helper(root: &std::path::Path) -> PathBuf {
+    let source = root.join("leader-exit.c");
+    let binary = root.join("leader-exit");
+    std::fs::write(
+        &source,
+        r#"#include <fcntl.h>
+#include <pthread.h>
+#include <unistd.h>
+
+static void *worker(void *arg) {
+    usleep(50000);
+    int fd = open((const char *)arg, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if (fd < 0) return (void *)1;
+    if (write(fd, "ncda-io!", 8) != 8) return (void *)1;
+    if (close(fd) != 0) return (void *)1;
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    pthread_t thread;
+    if (argc != 2 || pthread_create(&thread, 0, worker, argv[1]) != 0) return 1;
+    pthread_exit(0);
+}
+"#,
+    )
+    .unwrap();
+    let output = Command::new("cc")
+        .args(["-O2", "-pthread"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "failed to compile leader-exit helper: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
 }
 
 fn raise_memlock_limit() {
