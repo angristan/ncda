@@ -171,32 +171,52 @@ async fn main() -> Result<()> {
     // drains every kernel record, while the aggregator counts and discards
     // pending batches instead of rebuilding state that will never be shown.
     let shutdown_started = Instant::now();
+    let mut failures = Vec::new();
+    if let Err(error) = mode_result {
+        failures.push(format!("output: {error:#}"));
+    }
     discard_pending.store(true, Ordering::Release);
     let _ = container_shutdown_tx.send(true);
     if let Err(error) = attached.detach(&mut ebpf) {
-        warn!("ordered eBPF detach failed: {error:#}");
+        failures.push(format!("ordered eBPF detach: {error:#}"));
     }
     drop(ebpf);
     let _ = reader_shutdown_tx.send(true);
-    reader_handle.await.context("BPF reader task panicked")??;
-    info!("ring drained in {:?}", shutdown_started.elapsed());
-    aggregator_handle
-        .await
-        .context("aggregator task panicked")?;
+    match reader_handle.await {
+        Ok(Ok(())) => info!("ring drained in {:?}", shutdown_started.elapsed()),
+        Ok(Err(error)) => failures.push(format!("BPF reader: {error:#}")),
+        Err(error) => failures.push(format!("BPF reader panicked: {error}")),
+    }
+    if let Err(error) = aggregator_handle.await {
+        failures.push(format!("aggregator panicked: {error}"));
+    }
     info!("queue closed in {:?}", shutdown_started.elapsed());
 
-    container_handle
-        .await
-        .context("container discovery task panicked")??;
-    info!("enrichment stopped in {:?}", shutdown_started.elapsed());
+    match container_handle.await {
+        Ok(Ok(())) => info!("enrichment stopped in {:?}", shutdown_started.elapsed()),
+        Ok(Err(error)) => failures.push(format!("container discovery: {error:#}")),
+        Err(error) => failures.push(format!("container discovery panicked: {error}")),
+    }
 
     let _ = stats_shutdown_tx.send(true);
     if !output_finished {
-        output_handle.await.context("output task panicked")??;
+        match output_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(format!("output: {error:#}")),
+            Err(error) => failures.push(format!("output task panicked: {error}")),
+        }
     }
-    let final_drops = stats_handle
-        .await
-        .context("capture stats task panicked")??;
+    let final_drops = match stats_handle.await {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(error)) => {
+            failures.push(format!("capture stats: {error:#}"));
+            DropSnapshot::default()
+        }
+        Err(error) => {
+            failures.push(format!("capture stats task panicked: {error}"));
+            DropSnapshot::default()
+        }
+    };
     info!("shutdown completed in {:?}", shutdown_started.elapsed());
     if final_drops.shutdown_discarded > 0 {
         info!(
@@ -216,7 +236,11 @@ async fn main() -> Result<()> {
         );
     }
 
-    mode_result
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(failures.join("\n")))
+    }
 }
 
 #[derive(Debug)]
