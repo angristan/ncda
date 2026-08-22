@@ -3,11 +3,13 @@
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::OpenOptions;
+use std::io::BufRead;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aya::maps::{PerCpuArray, RingBuf};
 use aya::{Ebpf, EbpfLoader};
@@ -418,6 +420,42 @@ async fn captures_extended_fd_lifecycle_without_loss() {
     assert_eq!(userspace.parse_drops, 0);
     assert_eq!(userspace.queue_drops, 0);
     assert_eq!(userspace.shutdown_discarded, 0);
+}
+
+#[test]
+#[ignore = "requires root and live eBPF support"]
+fn sigterm_uses_ordered_shutdown() {
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run with scripts/test-ebpf.sh"
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ncda"))
+        .arg("--stdout")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut lines = std::io::BufReader::new(stdout).lines();
+    assert_eq!(
+        lines.next().transpose().unwrap().as_deref(),
+        Some("ncda: monitoring file access (Ctrl+C to stop)...")
+    );
+
+    let started = Instant::now();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "ncda did not finish ordered shutdown after SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(status.success(), "ncda exited with {status}");
 }
 
 #[test]
