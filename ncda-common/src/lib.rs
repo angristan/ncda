@@ -13,6 +13,15 @@ pub const EVENT_CLOSE_RANGE: u32 = 6;
 pub const EVENT_PROCESS_EXEC: u32 = 7;
 pub const EVENT_PROCESS_EXIT: u32 = 8;
 
+/// Linux `close(2)` leaves the descriptor untouched only for `EBADF`.
+pub const LINUX_EBADF: i64 = 9;
+/// `close_range(2)` marks descriptors close-on-exec instead of closing them.
+pub const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+
+pub const fn close_releases_fd(result: i64) -> bool {
+    result != -LINUX_EBADF
+}
+
 /// Open event — includes the filename captured at openat() time.
 /// Sent from eBPF to userspace via RingBuf.
 /// Size: 32 + 256 = 288 bytes.
@@ -156,3 +165,17 @@ const _: [(); 32] = [(); core::mem::size_of::<FdEvent>()];
 const _: [(); 32] = [(); core::mem::size_of::<RangeEvent>()];
 const _: [(); 16] = [(); core::mem::size_of::<ProcessEvent>()];
 const _: [(); 56] = [(); core::mem::size_of::<CaptureStats>()];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_close_releases_fd_on_late_errors() {
+        assert!(close_releases_fd(0));
+        assert!(close_releases_fd(-5)); // EIO
+        assert!(close_releases_fd(-28)); // ENOSPC
+        assert!(close_releases_fd(-4)); // EINTR
+        assert!(!close_releases_fd(-LINUX_EBADF));
+    }
+}

@@ -221,15 +221,18 @@ impl AppState {
                 pid,
                 first_fd,
                 last_fd,
+                flags,
                 ..
             } => {
-                let keys: Vec<_> = positions
-                    .keys()
-                    .copied()
-                    .filter(|key| key.pid == *pid && key.fd >= *first_fd && key.fd <= *last_fd)
-                    .collect();
-                for key in keys {
-                    self.flush_io_key(key, groups, positions);
+                if flags & ncda_common::CLOSE_RANGE_CLOEXEC == 0 {
+                    let keys: Vec<_> = positions
+                        .keys()
+                        .copied()
+                        .filter(|key| key.pid == *pid && key.fd >= *first_fd && key.fd <= *last_fd)
+                        .collect();
+                    for key in keys {
+                        self.flush_io_key(key, groups, positions);
+                    }
                 }
             }
             BpfEvent::ProcessExec { pid, .. } | BpfEvent::ProcessExit { pid, .. } => {
@@ -359,9 +362,10 @@ impl AppState {
                 pid,
                 first_fd,
                 last_fd,
+                flags,
                 ..
             } => {
-                self.fd_cache.on_close_range(pid, first_fd, last_fd);
+                self.fd_cache.on_close_range(pid, first_fd, last_fd, flags);
             }
             BpfEvent::ProcessExec { pid, .. } | BpfEvent::ProcessExit { pid, .. } => {
                 self.fd_cache.on_process_reset(pid);
@@ -599,6 +603,47 @@ mod tests {
         assert_eq!(positions.len(), 1);
         assert_eq!(groups.iter().flatten().count(), 1);
         assert_eq!(groups[0].as_ref().unwrap().operations, 2);
+    }
+
+    #[test]
+    fn close_range_cloexec_preserves_descriptor_and_io_group() {
+        let pid = u32::MAX;
+        let mut state = AppState::new(Duration::from_secs(5), Vec::new());
+        state.fd_cache.store(pid, 3, "/tmp/file".to_string());
+        state.ingest(vec![
+            BpfEvent::Read {
+                pid,
+                tid: pid,
+                fd: 3,
+                bytes: 4,
+                result: 4,
+                latency_ns: 10,
+                emitted_ns: 1,
+            },
+            BpfEvent::CloseRange {
+                pid,
+                tid: pid,
+                first_fd: 3,
+                last_fd: 3,
+                flags: ncda_common::CLOSE_RANGE_CLOEXEC,
+                emitted_ns: 2,
+            },
+            BpfEvent::Read {
+                pid,
+                tid: pid,
+                fd: 3,
+                bytes: 8,
+                result: 8,
+                latency_ns: 20,
+                emitted_ns: 3,
+            },
+        ]);
+
+        assert_eq!(state.fd_cache.lookup(pid, 3), Some("/tmp/file"));
+        let stats = &state.tree.root.children["tmp"].children["file"].stats;
+        assert_eq!(stats.read_ops, 2);
+        assert_eq!(stats.read_bytes, 12);
+        assert_eq!(stats.total_latency_ns, 30);
     }
 
     #[test]

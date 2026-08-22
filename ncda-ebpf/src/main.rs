@@ -332,7 +332,9 @@ fn exit_io(pid_tgid: u64, result: i64, args: &RwArgs) {
 
 #[inline(always)]
 fn exit_close(pid_tgid: u64, result: i64, fd: u32) {
-    if result != 0 {
+    // Linux releases the descriptor before reporting late close errors. EBADF
+    // is the only result that proves the descriptor was not valid.
+    if !close_releases_fd(result) {
         return;
     }
     let zero = unsafe { core::ptr::read_volatile(&0_u64) };
@@ -341,7 +343,7 @@ fn exit_close(pid_tgid: u64, result: i64, fd: u32) {
         pid: (pid_tgid >> 32) as u32,
         tid: pid_tgid as u32,
         fd,
-        result: zero as i64,
+        result,
         latency_ns: zero,
         emitted_ns: unsafe { bpf_ktime_get_ns() },
     };
@@ -389,8 +391,16 @@ fn exit_close_range(pid_tgid: u64, result: i64, args: &RangeArgs) {
 }
 
 #[inline(always)]
-fn emit_process_event(kind: u32) {
-    let pid_tgid = bpf_get_current_pid_tgid();
+fn clear_stashes(pid_tgid: u64) {
+    let _ = OPEN_STASH.remove(&pid_tgid);
+    let _ = IO_STASH.remove(&pid_tgid);
+    let _ = CLOSE_STASH.remove(&pid_tgid);
+    let _ = DUP_STASH.remove(&pid_tgid);
+    let _ = RANGE_STASH.remove(&pid_tgid);
+}
+
+#[inline(always)]
+fn emit_process_event(kind: u32, pid_tgid: u64) {
     let pid = (pid_tgid >> 32) as u32;
     let tid = pid_tgid as u32;
     if pid != tid {
@@ -408,13 +418,17 @@ fn emit_process_event(kind: u32) {
 
 #[raw_tracepoint(tracepoint = "sched_process_exec")]
 pub fn sched_process_exec(_ctx: RawTracePointContext) -> i32 {
-    emit_process_event(EVENT_PROCESS_EXEC);
+    emit_process_event(EVENT_PROCESS_EXEC, bpf_get_current_pid_tgid());
     0
 }
 
 #[raw_tracepoint(tracepoint = "sched_process_exit")]
 pub fn sched_process_exit(_ctx: RawTracePointContext) -> i32 {
-    emit_process_event(EVENT_PROCESS_EXIT);
+    let pid_tgid = bpf_get_current_pid_tgid();
+    // A task can terminate without returning through sys_exit. Always clear
+    // thread-scoped correlation state, even when this is not the group leader.
+    clear_stashes(pid_tgid);
+    emit_process_event(EVENT_PROCESS_EXIT, pid_tgid);
     0
 }
 

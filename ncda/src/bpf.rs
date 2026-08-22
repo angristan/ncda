@@ -474,7 +474,10 @@ impl FdPathCache {
         self.map.remove(&(pid, fd));
     }
 
-    pub fn on_close_range(&mut self, pid: u32, first_fd: u32, last_fd: u32) {
+    pub fn on_close_range(&mut self, pid: u32, first_fd: u32, last_fd: u32, flags: u32) {
+        if flags & CLOSE_RANGE_CLOEXEC != 0 {
+            return;
+        }
         self.map
             .retain(|(entry_pid, fd), _| *entry_pid != pid || *fd < first_fd || *fd > last_fd);
     }
@@ -740,12 +743,16 @@ mod tests {
         }
         cache.store(43, 5, "/tmp/other".to_string());
 
-        cache.on_close_range(42, 4, 6);
+        cache.on_close_range(42, 4, 6, 0);
         assert!(cache.lookup(42, 3).is_some());
         assert!(cache.lookup(42, 4).is_none());
         assert!(cache.lookup(42, 6).is_none());
         assert!(cache.lookup(42, 7).is_some());
         assert!(cache.lookup(43, 5).is_some());
+
+        cache.on_close_range(42, 3, 7, CLOSE_RANGE_CLOEXEC);
+        assert!(cache.lookup(42, 3).is_some());
+        assert!(cache.lookup(42, 7).is_some());
 
         cache.on_process_reset(42);
         assert!(cache.lookup(42, 3).is_none());
