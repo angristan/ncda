@@ -259,7 +259,8 @@ async fn captures_extended_fd_lifecycle_without_loss() {
         .iter()
         .filter(|event| {
             matches!(event, BpfEvent::Open { pid: event_pid, path, .. }
-                if *event_pid == pid && (path == "lifecycle.dat" || path == "openat2.dat"))
+                if *event_pid == pid
+                    && (path.as_slice() == b"lifecycle.dat" || path.as_slice() == b"openat2.dat"))
         })
         .count();
     assert_eq!(opens, 2);

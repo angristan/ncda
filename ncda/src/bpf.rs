@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -23,7 +23,8 @@ pub enum BpfEvent {
         tid: u32,
         fd: u32,
         dirfd: i32,
-        path: String,
+        path: Vec<u8>,
+        path_flags: u16,
         emitted_ns: u64,
     },
     Read {
@@ -310,18 +311,25 @@ fn parse_open_event(data: &[u8]) -> Option<BpfEvent> {
     let pid = u32::from_ne_bytes(data[4..8].try_into().ok()?);
     let tid = u32::from_ne_bytes(data[8..12].try_into().ok()?);
     let fd = u32::from_ne_bytes(data[12..16].try_into().ok()?);
-    let fname_len = u32::from_ne_bytes(data[16..20].try_into().ok()?);
+    let fname_len = u16::from_ne_bytes(data[16..18].try_into().ok()?) as usize;
+    let path_flags = u16::from_ne_bytes(data[18..20].try_into().ok()?);
     let dirfd = i32::from_ne_bytes(data[20..24].try_into().ok()?);
 
-    let emitted_ns = u64::from_ne_bytes(data[24..32].try_into().ok()?);
-    let fname_start = 32; // after metadata and emission timestamp
-    let fname_end = fname_start + (fname_len as usize).min(MAX_FNAME_LEN);
-    let fname_bytes = &data[fname_start..fname_end.min(data.len())];
+    if fname_len > MAX_FNAME_LEN || path_flags & !PATH_KNOWN_FLAGS != 0 {
+        return None;
+    }
+    if path_flags & PATH_READ_FAILED != 0 && fname_len != 0 {
+        return None;
+    }
 
-    // The filename may be null-terminated
-    let path = String::from_utf8_lossy(fname_bytes)
-        .trim_end_matches('\0')
-        .to_string();
+    let emitted_ns = u64::from_ne_bytes(data[24..32].try_into().ok()?);
+    let fname_start = 32;
+    let fname_end = fname_start + fname_len;
+    let path = data[fname_start..fname_end].to_vec();
+    let tail = &data[fname_end..fname_start + MAX_FNAME_LEN];
+    if path.contains(&0) || tail.iter().any(|byte| *byte != 0) {
+        return None;
+    }
 
     Some(BpfEvent::Open {
         pid,
@@ -329,6 +337,7 @@ fn parse_open_event(data: &[u8]) -> Option<BpfEvent> {
         fd,
         dirfd,
         path,
+        path_flags,
         emitted_ns,
     })
 }
@@ -429,7 +438,7 @@ pub struct FdPathCache {
     map: HashMap<(u32, u32), String>,
     /// Cache of /proc/<pid>/root for container path resolution.
     /// `None` means the process root is `/` (not containerised).
-    root_cache: HashMap<u32, Option<String>>,
+    root_cache: HashMap<u32, Option<Vec<u8>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -453,24 +462,35 @@ impl FdPathCache {
         }
     }
 
-    /// Resolve a newly opened descriptor without trusting a delayed procfs
-    /// target by itself. Relative candidates must still match the descriptor's
-    /// current target; otherwise activity is kept in the unresolved namespace.
-    pub fn resolve(&mut self, pid: u32, fd: u32, dirfd: i32, raw_path: &str) -> PathResolution {
+    /// Resolve a newly opened descriptor without trusting an incomplete path.
+    /// Relative candidates must also match the descriptor's current procfs
+    /// target; otherwise activity is kept in the unresolved namespace.
+    pub fn resolve(
+        &mut self,
+        pid: u32,
+        fd: u32,
+        dirfd: i32,
+        raw_path: &[u8],
+        path_flags: u16,
+    ) -> PathResolution {
+        if path_flags != 0 {
+            return PathResolution::Unresolved(unresolved_path(pid, fd, raw_path));
+        }
+
         match classify_pseudo_path(raw_path) {
             PseudoPath::Ignore => return PathResolution::Ignored,
             PseudoPath::Memory(path) => return PathResolution::Resolved(path),
             PseudoPath::Ordinary => {}
         }
 
-        if raw_path.starts_with('/') {
+        if raw_path.starts_with(b"/") {
             if matches!(
                 self.resolve_proc_target(pid, fd),
                 Some(PathResolution::Ignored)
             ) {
                 return PathResolution::Ignored;
             }
-            return PathResolution::Resolved(normalize_absolute_path(raw_path));
+            return PathResolution::Resolved(display_path(&normalize_absolute_path(raw_path)));
         }
 
         let base = if dirfd == libc::AT_FDCWD {
@@ -478,11 +498,14 @@ impl FdPathCache {
         } else {
             std::fs::read_link(format!("/proc/{pid}/fd/{dirfd}"))
         };
-        let Some(base) = base.ok().and_then(|path| path.to_str().map(str::to_string)) else {
+        let Some(base) = base.ok().map(|path| path.as_os_str().as_bytes().to_vec()) else {
             return PathResolution::Unresolved(unresolved_path(pid, fd, raw_path));
         };
-        let expected =
-            normalize_absolute_path(&self.strip_container_root(pid, &format!("{base}/{raw_path}")));
+        let mut candidate = base;
+        candidate.push(b'/');
+        candidate.extend_from_slice(raw_path);
+        let candidate = self.strip_container_root(pid, &candidate);
+        let expected = display_path(&normalize_absolute_path(&candidate));
 
         match self.resolve_proc_target(pid, fd) {
             Some(PathResolution::Resolved(actual)) if actual == expected => {
@@ -545,43 +568,40 @@ impl FdPathCache {
 
     fn resolve_proc_target(&mut self, pid: u32, fd: u32) -> Option<PathResolution> {
         let resolved = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
-        let path = resolved.to_str()?.trim_end_matches(" (deleted)");
+        let path = trim_deleted_suffix(resolved.as_os_str().as_bytes());
         match classify_pseudo_path(path) {
             PseudoPath::Ignore => Some(PathResolution::Ignored),
             PseudoPath::Memory(path) => Some(PathResolution::Resolved(path)),
-            PseudoPath::Ordinary if path.starts_with('/') => {
+            PseudoPath::Ordinary if path.starts_with(b"/") => {
                 let path = self.strip_container_root(pid, path);
-                Some(PathResolution::Resolved(normalize_absolute_path(&path)))
+                Some(PathResolution::Resolved(display_path(
+                    &normalize_absolute_path(&path),
+                )))
             }
             PseudoPath::Ordinary => None,
         }
     }
 
     /// Strip the container's root filesystem prefix from a host-side path.
-    ///
-    /// For example, if `/proc/<pid>/root` points to
-    /// `/var/lib/docker/overlay2/<hash>/merged`, a host path of
-    /// `/var/lib/docker/overlay2/<hash>/merged/var/www/html/index.php`
-    /// becomes `/var/www/html/index.php`.
-    fn strip_container_root(&mut self, pid: u32, host_path: &str) -> String {
+    fn strip_container_root(&mut self, pid: u32, host_path: &[u8]) -> Vec<u8> {
         let root = self.root_cache.entry(pid).or_insert_with(|| {
             std::fs::read_link(format!("/proc/{pid}/root"))
                 .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .filter(|r| r != "/")
+                .map(|path| path.as_os_str().as_bytes().to_vec())
+                .filter(|root| root != b"/")
         });
 
-        if let Some(root_str) = root {
-            if let Ok(stripped) = Path::new(host_path).strip_prefix(Path::new(root_str)) {
-                return if stripped.as_os_str().is_empty() {
-                    "/".to_string()
-                } else {
-                    format!("/{}", stripped.to_string_lossy())
-                };
+        if let Some(root) = root {
+            if host_path == root.as_slice() {
+                return b"/".to_vec();
+            }
+            if host_path.starts_with(root)
+                && host_path.get(root.len()).is_some_and(|byte| *byte == b'/')
+            {
+                return host_path[root.len()..].to_vec();
             }
         }
-
-        host_path.to_string()
+        host_path.to_vec()
     }
 }
 
@@ -592,26 +612,28 @@ enum PseudoPath {
     Memory(String),
 }
 
-fn classify_pseudo_path(path: &str) -> PseudoPath {
-    let path = path.trim_end_matches(" (deleted)");
-    let target = path.strip_prefix('/').unwrap_or(path);
-    if target.starts_with("socket:")
-        || target.starts_with("pipe:")
-        || target.starts_with("anon_inode:")
+fn classify_pseudo_path(path: &[u8]) -> PseudoPath {
+    let path = trim_deleted_suffix(path);
+    let target = path.strip_prefix(b"/").unwrap_or(path);
+    if target.starts_with(b"socket:")
+        || target.starts_with(b"pipe:")
+        || target.starts_with(b"anon_inode:")
     {
         return PseudoPath::Ignore;
     }
-    if let Some(name) = target.strip_prefix("memfd:") {
-        // A memfd name may contain slashes, but it is one kernel object rather
-        // than a filesystem hierarchy. Keep it in one safe display component.
-        let name = name.replace('/', "∕");
+    if let Some(name) = target.strip_prefix(b"memfd:") {
+        let name = display_path(name).replace('/', "∕");
         return PseudoPath::Memory(format!("/[memory]/memfd:{name}"));
     }
     PseudoPath::Ordinary
 }
 
-fn unresolved_path(pid: u32, fd: u32, raw_path: &str) -> String {
-    let raw_path = normalize_relative_path(raw_path);
+fn trim_deleted_suffix(path: &[u8]) -> &[u8] {
+    path.strip_suffix(b" (deleted)").unwrap_or(path)
+}
+
+fn unresolved_path(pid: u32, fd: u32, raw_path: &[u8]) -> String {
+    let raw_path = display_path(&normalize_relative_path(raw_path));
     if raw_path.is_empty() {
         format!("/[unresolved]/pid-{pid}/fd-{fd}")
     } else {
@@ -619,27 +641,86 @@ fn unresolved_path(pid: u32, fd: u32, raw_path: &str) -> String {
     }
 }
 
-fn normalize_absolute_path(path: &str) -> String {
+fn normalize_absolute_path(path: &[u8]) -> Vec<u8> {
     let normalized = normalize_relative_path(path);
     if normalized.is_empty() {
-        "/".to_string()
+        b"/".to_vec()
     } else {
-        format!("/{normalized}")
+        let mut absolute = Vec::with_capacity(normalized.len() + 1);
+        absolute.push(b'/');
+        absolute.extend_from_slice(&normalized);
+        absolute
     }
 }
 
-fn normalize_relative_path(path: &str) -> String {
-    let mut components = Vec::new();
-    for component in path.split('/') {
+fn normalize_relative_path(path: &[u8]) -> Vec<u8> {
+    let mut components: Vec<&[u8]> = Vec::new();
+    for component in path.split(|byte| *byte == b'/') {
         match component {
-            "" | "." => {}
-            ".." => {
+            b"" | b"." => {}
+            b".." => {
                 components.pop();
             }
             component => components.push(component),
         }
     }
-    components.join("/")
+
+    let total = components
+        .iter()
+        .map(|component| component.len())
+        .sum::<usize>()
+        + components.len().saturating_sub(1);
+    let mut normalized = Vec::with_capacity(total);
+    for (index, component) in components.into_iter().enumerate() {
+        if index > 0 {
+            normalized.push(b'/');
+        }
+        normalized.extend_from_slice(component);
+    }
+    normalized
+}
+
+/// Render arbitrary Linux pathname bytes injectively and without terminal
+/// control sequences. Literal backslashes are doubled so `\\xff` cannot
+/// collide with an invalid byte rendered as `\xFF`.
+fn display_path(mut bytes: &[u8]) -> String {
+    let mut output = String::new();
+    while !bytes.is_empty() {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                push_display_text(&mut output, valid);
+                break;
+            }
+            Err(error) => {
+                let valid_len = error.valid_up_to();
+                if valid_len > 0 {
+                    let valid = unsafe { std::str::from_utf8_unchecked(&bytes[..valid_len]) };
+                    push_display_text(&mut output, valid);
+                }
+                let invalid_len = error.error_len().unwrap_or(bytes.len() - valid_len);
+                for byte in &bytes[valid_len..valid_len + invalid_len] {
+                    output.push_str(&format!("\\x{byte:02X}"));
+                }
+                bytes = &bytes[valid_len + invalid_len..];
+            }
+        }
+    }
+    output
+}
+
+fn push_display_text(output: &mut String, text: &str) {
+    for character in text.chars() {
+        if character == '\\' {
+            output.push_str("\\\\");
+        } else if character.is_control() {
+            let mut encoded = [0_u8; 4];
+            for byte in character.encode_utf8(&mut encoded).as_bytes() {
+                output.push_str(&format!("\\x{byte:02X}"));
+            }
+        } else {
+            output.push(character);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -682,6 +763,56 @@ mod tests {
     }
 
     #[test]
+    fn malformed_open_path_metadata_is_rejected() {
+        let mut open = [0_u8; 288];
+        open[0..4].copy_from_slice(&EVENT_OPEN.to_ne_bytes());
+
+        open[16..18].copy_from_slice(&1_u16.to_ne_bytes());
+        open[18..20].copy_from_slice(&(PATH_KNOWN_FLAGS << 1).to_ne_bytes());
+        assert!(parse_event(&open).is_none());
+
+        open[18..20].copy_from_slice(&PATH_READ_FAILED.to_ne_bytes());
+        assert!(parse_event(&open).is_none());
+
+        open[16..18].copy_from_slice(&3_u16.to_ne_bytes());
+        open[18..20].copy_from_slice(&0_u16.to_ne_bytes());
+        open[32..35].copy_from_slice(b"a\0b");
+        assert!(parse_event(&open).is_none());
+
+        open[32..35].copy_from_slice(b"abc");
+        open[40] = 1;
+        assert!(parse_event(&open).is_none());
+    }
+
+    #[test]
+    fn truncated_paths_remain_explicitly_unresolved() {
+        let mut open = [0_u8; 288];
+        open[0..4].copy_from_slice(&EVENT_OPEN.to_ne_bytes());
+        open[4..8].copy_from_slice(&7_u32.to_ne_bytes());
+        open[12..16].copy_from_slice(&9_u32.to_ne_bytes());
+        open[16..18].copy_from_slice(&(MAX_FNAME_LEN as u16).to_ne_bytes());
+        open[18..20].copy_from_slice(&PATH_TRUNCATED.to_ne_bytes());
+        open[20..24].copy_from_slice(&libc::AT_FDCWD.to_ne_bytes());
+        open[32..].fill(b'a');
+
+        let Some(BpfEvent::Open {
+            pid,
+            fd,
+            dirfd,
+            path,
+            path_flags,
+            ..
+        }) = parse_event(&open)
+        else {
+            panic!("truncated open event was not parsed");
+        };
+        let mut cache = FdPathCache::new();
+        let resolved = cache.resolve(pid, fd, dirfd, &path, path_flags);
+        assert!(matches!(resolved, PathResolution::Unresolved(path)
+            if path.starts_with("/[unresolved]/pid-7/fd-9/")));
+    }
+
+    #[test]
     fn parser_preserves_failed_io_result_without_bytes() {
         let mut event = [0_u8; 40];
         event[0..4].copy_from_slice(&EVENT_READ.to_ne_bytes());
@@ -712,7 +843,8 @@ mod tests {
         open[4..8].copy_from_slice(&7_u32.to_ne_bytes());
         open[8..12].copy_from_slice(&8_u32.to_ne_bytes());
         open[12..16].copy_from_slice(&9_u32.to_ne_bytes());
-        open[16..20].copy_from_slice(&4_u32.to_ne_bytes());
+        open[16..18].copy_from_slice(&4_u16.to_ne_bytes());
+        open[18..20].copy_from_slice(&0_u16.to_ne_bytes());
         open[20..24].copy_from_slice(&(-100_i32).to_ne_bytes());
         open[24..32].copy_from_slice(&123_u64.to_ne_bytes());
         open[32..36].copy_from_slice(b"file");
@@ -724,8 +856,9 @@ mod tests {
                 fd: 9,
                 dirfd: -100,
                 ref path,
+                path_flags: 0,
                 emitted_ns: 123,
-            }) if path == "file"
+            }) if path == b"file"
         ));
 
         let mut dup = [0_u8; 32];
@@ -808,7 +941,7 @@ mod tests {
     fn global_invalidation_clears_descriptor_and_root_state() {
         let mut cache = FdPathCache::new();
         cache.store(42, 3, "/tmp/file".to_string());
-        cache.root_cache.insert(42, Some("/container".to_string()));
+        cache.root_cache.insert(42, Some(b"/container".to_vec()));
 
         cache.invalidate_all();
 
@@ -827,7 +960,8 @@ mod tests {
             std::process::id(),
             file.as_raw_fd() as u32,
             directory.as_raw_fd(),
-            "null",
+            b"null",
+            0,
         );
 
         assert_eq!(resolved, PathResolution::Resolved("/dev/null".to_string()));
@@ -844,7 +978,8 @@ mod tests {
             std::process::id(),
             reused.as_raw_fd() as u32,
             directory.as_raw_fd(),
-            "null",
+            b"null",
+            0,
         );
 
         assert!(matches!(result, PathResolution::Unresolved(path) if path.ends_with("/null")));
@@ -853,7 +988,7 @@ mod tests {
     #[test]
     fn unresolved_relative_paths_do_not_pollute_root() {
         let mut cache = FdPathCache::new();
-        let resolved = cache.resolve(u32::MAX, u32::MAX, libc::AT_FDCWD, "../../b006");
+        let resolved = cache.resolve(u32::MAX, u32::MAX, libc::AT_FDCWD, b"../../b006", 0);
 
         assert_eq!(
             resolved,
@@ -865,14 +1000,14 @@ mod tests {
 
     #[test]
     fn pseudo_descriptors_are_filtered_or_grouped() {
-        assert_eq!(classify_pseudo_path("socket:[123]"), PseudoPath::Ignore);
-        assert_eq!(classify_pseudo_path("pipe:[123]"), PseudoPath::Ignore);
+        assert_eq!(classify_pseudo_path(b"socket:[123]"), PseudoPath::Ignore);
+        assert_eq!(classify_pseudo_path(b"pipe:[123]"), PseudoPath::Ignore);
         assert_eq!(
-            classify_pseudo_path("anon_inode:[eventfd]"),
+            classify_pseudo_path(b"anon_inode:[eventfd]"),
             PseudoPath::Ignore
         );
         assert_eq!(
-            classify_pseudo_path("/memfd:sd/executor-state (deleted)"),
+            classify_pseudo_path(b"/memfd:sd/executor-state (deleted)"),
             PseudoPath::Memory("/[memory]/memfd:sd∕executor-state".to_string())
         );
     }
@@ -880,10 +1015,10 @@ mod tests {
     #[test]
     fn filesystem_paths_are_lexically_normalized() {
         assert_eq!(
-            normalize_absolute_path("/sys/devices/../bus/./pci"),
-            "/sys/bus/pci"
+            normalize_absolute_path(b"/sys/devices/../bus/./pci"),
+            b"/sys/bus/pci"
         );
-        assert_eq!(normalize_absolute_path("/../../etc/hosts"), "/etc/hosts");
+        assert_eq!(normalize_absolute_path(b"/../../etc/hosts"), b"/etc/hosts");
     }
 
     #[test]
@@ -901,17 +1036,30 @@ mod tests {
     }
 
     #[test]
-    fn parser_lossily_preserves_non_utf8_paths() {
+    fn parser_preserves_non_utf8_paths_exactly() {
         let mut open = [0_u8; 288];
         open[0..4].copy_from_slice(&EVENT_OPEN.to_ne_bytes());
-        open[16..20].copy_from_slice(&3_u32.to_ne_bytes());
+        open[16..18].copy_from_slice(&3_u16.to_ne_bytes());
         open[20..24].copy_from_slice(&libc::AT_FDCWD.to_ne_bytes());
         open[32..35].copy_from_slice(&[b'a', 0xff, b'b']);
 
         assert!(matches!(
             parse_event(&open),
-            Some(BpfEvent::Open { ref path, .. }) if path == "a�b"
+            Some(BpfEvent::Open { ref path, .. }) if path == b"a\xffb"
         ));
+        assert_eq!(display_path(b"a\xffb"), "a\\xFFb");
+        assert_eq!(display_path(b"a\\xFFb"), "a\\\\xFFb");
+    }
+
+    #[test]
+    fn invalid_path_bytes_have_distinct_safe_identifiers() {
+        let mut cache = FdPathCache::new();
+        let first = cache.resolve(u32::MAX, 3, libc::AT_FDCWD, b"/tmp/a\xff", 0);
+        let second = cache.resolve(u32::MAX, 4, libc::AT_FDCWD, b"/tmp/a\xfe", 0);
+
+        assert_eq!(first, PathResolution::Resolved("/tmp/a\\xFF".to_string()));
+        assert_eq!(second, PathResolution::Resolved("/tmp/a\\xFE".to_string()));
+        assert_ne!(first, second);
     }
 
     #[test]

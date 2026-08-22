@@ -312,9 +312,10 @@ impl AppState {
                 fd,
                 dirfd,
                 path,
+                path_flags,
                 ..
             } => {
-                let resolved = match self.fd_cache.resolve(pid, fd, dirfd, &path) {
+                let resolved = match self.fd_cache.resolve(pid, fd, dirfd, &path, path_flags) {
                     PathResolution::Resolved(path) => path,
                     PathResolution::Unresolved(path) => {
                         self.attribution_failures = self.attribution_failures.saturating_add(1);
@@ -888,7 +889,8 @@ mod tests {
             tid: pid,
             fd: 3,
             dirfd: libc::AT_FDCWD,
-            path: "socket:[123]".to_string(),
+            path: b"socket:[123]".to_vec(),
+            path_flags: 0,
             emitted_ns: 1,
         }]);
 
@@ -962,7 +964,8 @@ mod tests {
                 tid: pid,
                 fd: 3,
                 dirfd: libc::AT_FDCWD,
-                path: "/new".to_string(),
+                path: b"/new".to_vec(),
+                path_flags: 0,
                 emitted_ns: 3,
             },
             BpfEvent::Write {
@@ -1012,7 +1015,8 @@ mod tests {
                 tid: pid,
                 fd: 3,
                 dirfd: libc::AT_FDCWD,
-                path: "/tmp/ncda-dup-test".to_string(),
+                path: b"/tmp/ncda-dup-test".to_vec(),
+                path_flags: 0,
                 emitted_ns: 1,
             },
             BpfEvent::Dup {

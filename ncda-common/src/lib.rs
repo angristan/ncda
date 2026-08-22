@@ -1,7 +1,13 @@
 #![no_std]
 
-/// Maximum filename length captured in eBPF events.
+/// Maximum pathname bytes carried in an open event.
 pub const MAX_FNAME_LEN: usize = 256;
+/// Extra probe capacity distinguishes an exact 256-byte path from truncation.
+pub const PROBE_FNAME_LEN: usize = MAX_FNAME_LEN + 2;
+
+pub const PATH_TRUNCATED: u16 = 1 << 0;
+pub const PATH_READ_FAILED: u16 = 1 << 1;
+pub const PATH_KNOWN_FLAGS: u16 = PATH_TRUNCATED | PATH_READ_FAILED;
 
 // Event kind discriminants
 pub const EVENT_OPEN: u32 = 1;
@@ -32,7 +38,8 @@ pub struct OpenEvent {
     pub pid: u32,
     pub tid: u32,
     pub fd: u32,
-    pub fname_len: u32,
+    pub fname_len: u16,
+    pub fname_flags: u16,
     pub dirfd: i32,
     pub emitted_ns: u64,
     pub fname: [u8; MAX_FNAME_LEN],
@@ -108,8 +115,9 @@ unsafe impl aya::Pod for ProcessEvent {}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct OpenArgs {
-    pub fname: [u8; MAX_FNAME_LEN],
-    pub fname_len: u32,
+    pub fname: [u8; PROBE_FNAME_LEN],
+    pub fname_len: u16,
+    pub fname_flags: u16,
     pub dirfd: i32,
 }
 

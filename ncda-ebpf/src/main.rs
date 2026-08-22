@@ -206,11 +206,16 @@ fn enter_open(registers: *const u64, pid_tgid: u64) {
     let args = unsafe { &mut *scratch };
     args.dirfd = unsafe { syscall_arg(registers, 0) } as i32;
     args.fname_len = 0;
+    args.fname_flags = 0;
     let filename_ptr = unsafe { syscall_arg(registers, 1) };
-    if let Ok(filename) =
-        unsafe { bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut args.fname) }
-    {
-        args.fname_len = filename.len() as u32;
+    match unsafe { bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut args.fname) } {
+        Ok(filename) => {
+            if filename.len() > MAX_FNAME_LEN {
+                args.fname_flags |= PATH_TRUNCATED;
+            }
+            args.fname_len = filename.len().min(MAX_FNAME_LEN) as u16;
+        }
+        Err(_) => args.fname_flags |= PATH_READ_FAILED,
     }
     if OPEN_STASH.insert(&pid_tgid, args, 0).is_err() {
         record_stash_failure();
@@ -335,11 +340,16 @@ fn exit_open(pid_tgid: u64, result: i64, args: &OpenArgs) {
     event.tid = pid_tgid as u32;
     event.fd = result as u32;
     event.fname_len = args.fname_len;
+    event.fname_flags = args.fname_flags;
     event.dirfd = args.dirfd;
     event.emitted_ns = unsafe { bpf_ktime_get_ns() };
     let mut index = 0usize;
     while index < MAX_FNAME_LEN {
-        event.fname[index] = args.fname[index];
+        event.fname[index] = if index < args.fname_len as usize {
+            args.fname[index]
+        } else {
+            0
+        };
         index += 1;
     }
     if EVENTS.output::<OpenEvent>(unsafe { &*buf }, 0).is_err() {
