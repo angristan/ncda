@@ -99,12 +99,14 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Vec<BpfEvent>>(512);
     let reader_drops = Arc::new(ReaderDropCounters::default());
     let (reader_shutdown_tx, reader_shutdown_rx) = watch::channel(false);
-    let reader_handle = tokio::spawn(bpf::reader_loop(
-        ring_buf,
-        tx,
-        reader_shutdown_rx,
-        reader_drops.clone(),
-    ));
+    let (worker_exit_tx, mut worker_exit_rx) = mpsc::unbounded_channel::<WorkerExit>();
+    let reader_exit_tx = worker_exit_tx.clone();
+    let reader_task_drops = Arc::clone(&reader_drops);
+    let reader_handle = tokio::spawn(async move {
+        let result = bpf::reader_loop(ring_buf, tx, reader_shutdown_rx, reader_task_drops).await;
+        let _ = reader_exit_tx.send(WorkerExit::from_result("BPF reader", &result));
+        result
+    });
 
     // The reader is ready before global producers become active. Exit hooks
     // attach before sys_enter so no entry can outlive its consumer.
@@ -116,6 +118,7 @@ async fn main() -> Result<()> {
     let agg_discard_pending = Arc::clone(&discard_pending);
     let agg_reader_drops = Arc::clone(&reader_drops);
     let agg_state = state.clone();
+    let aggregator_exit_tx = worker_exit_tx.clone();
     let aggregator_handle = tokio::spawn(async move {
         while let Some(batch) = rx.recv().await {
             handle_aggregator_batch(
@@ -125,23 +128,44 @@ async fn main() -> Result<()> {
                 &agg_reader_drops,
             );
         }
+        let _ = aggregator_exit_tx.send(WorkerExit::ok("aggregator"));
     });
 
     // Keep the live drop count visible without reading BPF maps in the draw
     // path. A final sample is taken after the reader and aggregator stop.
     let (stats_shutdown_tx, stats_shutdown_rx) = watch::channel(false);
-    let stats_handle = tokio::spawn(monitor_drop_counters(
-        capture_stats,
-        reader_drops,
-        state.clone(),
-        stats_shutdown_rx,
-    ));
+    let stats_exit_tx = worker_exit_tx.clone();
+    let stats_state = state.clone();
+    let stats_handle = tokio::spawn(async move {
+        let result =
+            monitor_drop_counters(capture_stats, reader_drops, stats_state, stats_shutdown_rx)
+                .await;
+        let _ = stats_exit_tx.send(WorkerExit::from_result("capture stats", &result));
+        result
+    });
+    drop(worker_exit_tx);
 
-    let mode_result = if cli.stdout {
-        run_stdout_mode(state.clone()).await
+    let output_shutdown = Arc::new(AtomicBool::new(false));
+    let output_state = state.clone();
+    let output_flag = Arc::clone(&output_shutdown);
+    let mut output_handle = if cli.stdout {
+        tokio::spawn(run_stdout_mode(output_state, output_flag))
     } else {
-        run_tui_mode(state.clone())
+        tokio::task::spawn_blocking(move || tui::run_with_shutdown(output_state, output_flag))
     };
+    let mut output_finished = false;
+    let mode_result = tokio::select! {
+        result = &mut output_handle => {
+            output_finished = true;
+            result.context("output task panicked")?
+        }
+        signal = shutdown_signal() => signal,
+        worker = worker_exit_rx.recv() => {
+            let worker = worker.context("critical worker status channel closed")?;
+            Err(anyhow::anyhow!(worker.message()))
+        }
+    };
+    output_shutdown.store(true, Ordering::Release);
 
     // Stop expensive aggregation as soon as output ends. The reader still
     // drains every kernel record, while the aggregator counts and discards
@@ -167,6 +191,9 @@ async fn main() -> Result<()> {
     info!("enrichment stopped in {:?}", shutdown_started.elapsed());
 
     let _ = stats_shutdown_tx.send(true);
+    if !output_finished {
+        output_handle.await.context("output task panicked")??;
+    }
     let final_drops = stats_handle
         .await
         .context("capture stats task panicked")??;
@@ -190,6 +217,32 @@ async fn main() -> Result<()> {
     }
 
     mode_result
+}
+
+#[derive(Debug)]
+struct WorkerExit {
+    name: &'static str,
+    error: Option<String>,
+}
+
+impl WorkerExit {
+    fn ok(name: &'static str) -> Self {
+        Self { name, error: None }
+    }
+
+    fn from_result<T>(name: &'static str, result: &Result<T>) -> Self {
+        Self {
+            name,
+            error: result.as_ref().err().map(|error| format!("{error:#}")),
+        }
+    }
+
+    fn message(&self) -> String {
+        match &self.error {
+            Some(error) => format!("{} task failed: {error}", self.name),
+            None => format!("{} task stopped unexpectedly", self.name),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -312,21 +365,33 @@ fn add_ebpf_permission_hint(error: anyhow::Error) -> anyhow::Error {
     ))
 }
 
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("install SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("listen for SIGINT")?,
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await.context("listen for Ctrl+C")?;
+    Ok(())
+}
+
 /// Run in stdout mode — prints a periodic summary to the terminal.
-async fn run_stdout_mode(state: Arc<Mutex<AppState>>) -> Result<()> {
+async fn run_stdout_mode(state: Arc<Mutex<AppState>>, shutdown: Arc<AtomicBool>) -> Result<()> {
     println!("ncda: monitoring file access (Ctrl+C to stop)...\n");
-
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-
     let mut interval = tokio::time::interval(Duration::from_secs(1));
 
     loop {
+        if shutdown.load(Ordering::Acquire) {
+            println!("\nExiting.");
+            return Ok(());
+        }
         tokio::select! {
-            _ = &mut ctrl_c => {
-                println!("\nExiting.");
-                return Ok(());
-            }
             _ = interval.tick() => {
                 let s = state.lock().unwrap();
                 let root = &s.tree.root;
@@ -359,11 +424,6 @@ async fn run_stdout_mode(state: Arc<Mutex<AppState>>) -> Result<()> {
             }
         }
     }
-}
-
-/// Run the interactive TUI.
-fn run_tui_mode(state: Arc<Mutex<AppState>>) -> Result<()> {
-    tui::run(state)
 }
 
 #[cfg(test)]

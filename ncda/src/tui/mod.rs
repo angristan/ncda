@@ -8,6 +8,7 @@ pub mod layout;
 pub mod tree_view;
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -66,6 +67,13 @@ impl<R: RestoreTerminal> Drop for TerminalRestoreGuard<R> {
 
 /// Run the TUI event loop.
 pub fn run(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
+    run_with_shutdown(state, Arc::new(AtomicBool::new(false)))
+}
+
+pub fn run_with_shutdown(
+    state: Arc<Mutex<AppState>>,
+    shutdown: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     let _restore_terminal = TerminalRestoreGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -75,6 +83,9 @@ pub fn run(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
     let tick_rate = Duration::from_millis(250);
 
     loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
         // Reconcile by path before every render so a live re-sort does not
         // silently move the selection to another file.
         {
