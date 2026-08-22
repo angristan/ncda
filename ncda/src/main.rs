@@ -426,7 +426,8 @@ fn effective_capabilities() -> Option<u64> {
 }
 
 fn format_capabilities(bits: u64) -> String {
-    const CAPS: [(u32, &str); 4] = [
+    const CAPS: [(u32, &str); 5] = [
+        (19, "CAP_SYS_PTRACE"),
         (21, "CAP_SYS_ADMIN"),
         (24, "CAP_SYS_RESOURCE"),
         (38, "CAP_PERFMON"),
@@ -510,8 +511,8 @@ mod tests {
     fn capability_names_are_reported_precisely() {
         assert_eq!(format_capabilities(0), "none relevant");
         assert_eq!(
-            format_capabilities((1 << 38) | (1 << 39)),
-            "CAP_PERFMON,CAP_BPF"
+            format_capabilities((1 << 19) | (1 << 38) | (1 << 39)),
+            "CAP_SYS_PTRACE,CAP_PERFMON,CAP_BPF"
         );
     }
 
