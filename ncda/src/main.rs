@@ -53,6 +53,13 @@ async fn main() -> Result<()> {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     }
 
+    // Arm handlers before any global probe is attached. Signals received
+    // during later startup are then handled by the ordered shutdown path.
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
+
     // Bump memlock rlimit for older kernels
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
@@ -159,7 +166,8 @@ async fn main() -> Result<()> {
             output_finished = true;
             result.context("output task panicked")?
         }
-        signal = shutdown_signal() => signal,
+        result = &mut interrupt => result.context("listen for SIGINT"),
+        _ = terminate.recv() => Ok(()),
         worker = worker_exit_rx.recv() => {
             let worker = worker.context("critical worker status channel closed")?;
             Err(anyhow::anyhow!(worker.message()))
@@ -433,22 +441,6 @@ fn format_capabilities(bits: u64) -> String {
     } else {
         present.join(",")
     }
-}
-
-async fn shutdown_signal() -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .context("install SIGTERM handler")?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result.context("listen for SIGINT")?,
-            _ = terminate.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await.context("listen for Ctrl+C")?;
-    Ok(())
 }
 
 /// Run in stdout mode — prints a periodic summary to the terminal.
