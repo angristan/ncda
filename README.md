@@ -14,10 +14,12 @@ The recording uses real eBPF events from the reproducible [VHS tape](docs/demo.t
 
 - Linux 6.1 or newer (supported and tested baseline)
 - Native x86_64 or AArch64 userspace
-- Root, or an equivalent set of eBPF, tracing, and memory-lock capabilities
+- Root, or `CAP_BPF` + `CAP_PERFMON` (`CAP_SYS_ADMIN` on older kernels); cross-process procfs resolution can also require `CAP_SYS_PTRACE`
 - Rust 1.97.1 plus `nightly-2026-08-04`, `rust-src`, and `bpf-linker` 0.11 to build
 
-The eBPF ring buffer exists since Linux 5.8, but kernels older than 6.1 are not part of the tested support range. The syscall decoder does not support x86 ia32/x32 or ARM AArch32 compatibility ABIs.
+The eBPF ring buffer exists since Linux 5.8, but kernels older than 6.1 are not part of the tested support range. Unsupported x86 ia32/x32 and ARM AArch32 compatibility syscalls are detected and ignored rather than decoded as native calls. Linux 6.1–6.15 uses a `taskstats_exit` kprobe to identify the final thread; newer kernels use the `sched_process_exit` `group_dead` field.
+
+Linux 5.11 and newer normally account BPF allocations with memory cgroups. Older kernels can require a larger `RLIMIT_MEMLOCK` and `CAP_SYS_RESOURCE` to raise its hard limit. Kernel confidentiality lockdown can still deny tracing or kernel reads even with capabilities. Startup errors report the detected UID, relevant effective capabilities, lockdown state, and memory-lock limits.
 
 ## Install
 
@@ -72,9 +74,9 @@ The TUI supports flat and tree views, path/PID/process/container filters, sortab
 
 Byte counts, operation counts, rates, and average syscall latency include only successful operations that transferred at least one byte. Latency is measured in the kernel from syscall entry to syscall exit; it excludes ring delivery and UI processing. Failed completions and successful zero-byte completions are captured separately as `Err` and `Zero` diagnostics.
 
-Path attribution is fail-safe. Descriptor replacement, range close, exec, and exit invalidate cached state. If a delayed relative open no longer matches the current descriptor target, activity is placed under `/[unresolved]/pid-<pid>/fd-<fd>/` instead of being assigned to a possibly wrong file. `Attr` counts attribution failures. Anonymous memory files are grouped under `/[memory]/`; sockets, pipes, and other non-file pseudo descriptors are hidden.
+Path attribution is fail-safe. Descriptor replacement, range close, exec, and final-thread exit invalidate cached state. If a delayed relative open no longer matches the current descriptor target, activity is placed under `/[unresolved]/pid-<pid>/fd-<fd>/` instead of being assigned to a possibly wrong file. Truncated or unreadable kernel path captures are also unresolved. Linux pathname bytes are preserved exactly; invalid UTF-8 and terminal-control bytes are shown with injective `\\xNN` escapes. `Attr` counts attribution failures. Anonymous memory files are grouped under `/[memory]/`; sockets, pipes, and other non-file pseudo descriptors are hidden.
 
-`Drops` reports kernel ring/stash/scratch loss and userspace parse/queue loss. Any non-zero drop count means displayed activity is incomplete. On exit, ncda still drains the kernel ring but discards pending aggregation work because output has already closed; verbose logs report that intentional discard count.
+`Drops` reports kernel ring/stash/scratch loss and userspace parse/queue loss. Any new capture loss invalidates all cached descriptor attribution before more events are processed, so stale paths are never reused. The displayed activity is still incomplete. On exit, ncda drains the kernel ring but discards pending aggregation work because output has already closed; verbose logs report that intentional discard count. SIGINT, SIGTERM, output failure, and any critical capture-task failure use the same ordered detach and drain path.
 
 ## Benchmarking
 

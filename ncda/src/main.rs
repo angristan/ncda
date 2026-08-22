@@ -346,13 +346,16 @@ async fn monitor_drop_counters(
 }
 
 fn add_ebpf_permission_hint(error: anyhow::Error) -> anyhow::Error {
-    let permission_denied = error.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+    let resource_error = error.chain().find_map(|cause| {
+        cause.downcast_ref::<io::Error>().and_then(|error| {
+            matches!(
+                error.raw_os_error(),
+                Some(libc::EPERM | libc::EACCES | libc::ENOMEM)
+            )
+            .then_some(error.raw_os_error().unwrap_or_default())
+        })
     });
-
-    if !permission_denied {
+    if resource_error.is_none() {
         return error;
     }
 
@@ -360,9 +363,52 @@ fn add_ebpf_permission_hint(error: anyhow::Error) -> anyhow::Error {
         .next()
         .map(|arg| arg.to_string_lossy().into_owned())
         .unwrap_or_else(|| "ncda".to_string());
+    let caps = effective_capabilities().unwrap_or_default();
+    let lockdown = std::fs::read_to_string("/sys/kernel/security/lockdown")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_else(|_| "unavailable".to_string());
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let memlock = if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } == 0 {
+        format!("{}/{} bytes", limit.rlim_cur, limit.rlim_max)
+    } else {
+        "unavailable".to_string()
+    };
     error.context(format!(
-        "insufficient permissions to initialize eBPF; ncda requires root or suitable eBPF capabilities\nTry: sudo {program}"
+        "unable to initialize eBPF (uid={}, effective capabilities: {}; lockdown: {}; RLIMIT_MEMLOCK: {})\nRoot or CAP_BPF+CAP_PERFMON is normally required; CAP_SYS_ADMIN is the legacy alternative. CAP_SYS_PTRACE may also be needed for cross-process path resolution. On pre-5.11 kernels, increase RLIMIT_MEMLOCK (and CAP_SYS_RESOURCE may be required). Active confidentiality lockdown can deny kernel reads.\nTry: sudo {program}",
+        unsafe { libc::geteuid() },
+        format_capabilities(caps),
+        lockdown,
+        memlock,
     ))
+}
+
+fn effective_capabilities() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let value = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:\t"))?;
+    u64::from_str_radix(value.trim(), 16).ok()
+}
+
+fn format_capabilities(bits: u64) -> String {
+    const CAPS: [(u32, &str); 4] = [
+        (21, "CAP_SYS_ADMIN"),
+        (24, "CAP_SYS_RESOURCE"),
+        (38, "CAP_PERFMON"),
+        (39, "CAP_BPF"),
+    ];
+    let present = CAPS
+        .iter()
+        .filter_map(|(bit, name)| ((bits & (1_u64 << bit)) != 0).then_some(*name))
+        .collect::<Vec<_>>();
+    if present.is_empty() {
+        "none relevant".to_string()
+    } else {
+        present.join(",")
+    }
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -435,9 +481,22 @@ mod tests {
         let error = io::Error::from_raw_os_error(libc::EPERM).into();
         let message = format!("{:#}", add_ebpf_permission_hint(error));
 
-        assert!(message.contains("insufficient permissions to initialize eBPF"));
+        assert!(message.contains("unable to initialize eBPF"));
+        assert!(message.contains("CAP_BPF+CAP_PERFMON"));
+        assert!(message.contains("CAP_SYS_PTRACE"));
+        assert!(message.contains("RLIMIT_MEMLOCK"));
+        assert!(message.contains("lockdown:"));
         assert!(message.contains("Try: sudo"));
         assert!(message.contains("Operation not permitted"));
+    }
+
+    #[test]
+    fn capability_names_are_reported_precisely() {
+        assert_eq!(format_capabilities(0), "none relevant");
+        assert_eq!(
+            format_capabilities((1 << 38) | (1 << 39)),
+            "CAP_PERFMON,CAP_BPF"
+        );
     }
 
     #[test]
