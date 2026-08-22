@@ -525,6 +525,12 @@ impl FdPathCache {
         self.root_cache.remove(&pid);
     }
 
+    /// Discard all attribution state after an unscoped capture loss.
+    pub fn invalidate_all(&mut self) {
+        self.map.clear();
+        self.root_cache.clear();
+    }
+
     pub fn lookup(&self, pid: u32, fd: u32) -> Option<&str> {
         self.map.get(&(pid, fd)).map(|s| s.as_str())
     }
@@ -796,6 +802,18 @@ mod tests {
         assert!(cache.lookup(42, 3).is_none());
         assert!(cache.lookup(42, 7).is_none());
         assert!(cache.lookup(43, 5).is_some());
+    }
+
+    #[test]
+    fn global_invalidation_clears_descriptor_and_root_state() {
+        let mut cache = FdPathCache::new();
+        cache.store(42, 3, "/tmp/file".to_string());
+        cache.root_cache.insert(42, Some("/container".to_string()));
+
+        cache.invalidate_all();
+
+        assert!(cache.is_empty());
+        assert!(cache.root_cache.is_empty());
     }
 
     #[test]

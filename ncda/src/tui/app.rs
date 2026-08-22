@@ -432,6 +432,11 @@ impl AppState {
     }
 
     pub fn update_drop_total(&mut self, total: u64) {
+        if total > self.drop_total {
+            // Loss is not scoped to a PID or descriptor. Retaining any cached
+            // mapping could assign later I/O to a plausible but stale path.
+            self.fd_cache.invalidate_all();
+        }
         self.drop_total = total;
         self.dropped_events = total.saturating_sub(self.drop_baseline);
     }
@@ -825,6 +830,22 @@ mod tests {
         assert_eq!(state.dropped_events, 0);
         state.update_drop_total(9);
         assert_eq!(state.dropped_events, 2);
+    }
+
+    #[test]
+    fn new_capture_loss_invalidates_attribution_once() {
+        let mut state = AppState::new(Duration::from_secs(5), Vec::new());
+        state.fd_cache.store(42, 3, "/tmp/old".to_string());
+
+        state.update_drop_total(1);
+        assert_eq!(state.fd_cache.lookup(42, 3), None);
+
+        state.fd_cache.store(42, 3, "/tmp/current".to_string());
+        state.update_drop_total(1);
+        assert_eq!(state.fd_cache.lookup(42, 3), Some("/tmp/current"));
+
+        state.update_drop_total(2);
+        assert_eq!(state.fd_cache.lookup(42, 3), None);
     }
 
     #[test]
