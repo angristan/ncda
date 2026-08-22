@@ -314,6 +314,9 @@ pub fn sys_exit(ctx: RawTracePointContext) -> i32 {
     let pid_tgid = bpf_get_current_pid_tgid();
     let registers = ctx.arg::<usize>(0) as *const u64;
     let syscall = unsafe { syscall_number(registers) };
+    if !native_syscall_abi(registers, syscall) {
+        return 0;
+    }
     let result: i64 = ctx.arg(1);
 
     if syscall == arch::OPENAT || syscall == arch::OPENAT2 {
