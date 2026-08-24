@@ -1,25 +1,12 @@
 # ncda
 
-`ncda` is an ncdu-like terminal monitor for live Linux file I/O. It uses eBPF raw syscall tracepoints and shows system-wide activity as a navigable directory tree, a flat directory view, or periodic text output.
+`ncda` is an ncdu-like terminal monitor for live Linux file I/O. It uses eBPF to show system-wide reads and writes by path and process, either in an interactive TUI or as periodic text output.
 
 Built with [Aya](https://aya-rs.dev/) and [Ratatui](https://ratatui.rs/).
 
-## Demo
-
 ![ncda monitoring live Linux file I/O](docs/assets/ncda-demo.gif)
 
-The recording uses real eBPF events from the reproducible [VHS tape](docs/demo.tape) and [demo workload](scripts/demo-workload.sh).
-
-## Requirements
-
-- Linux 6.1 or newer (supported and tested baseline)
-- Native x86_64 or AArch64 userspace
-- Root, or `CAP_BPF` + `CAP_PERFMON` (`CAP_SYS_ADMIN` on older kernels); cross-process procfs resolution can also require `CAP_SYS_PTRACE`
-- Rust 1.97.1 plus `nightly-2026-08-04`, `rust-src`, and `bpf-linker` 0.11 to build
-
-The eBPF ring buffer exists since Linux 5.8, but kernels older than 6.1 are not part of the tested support range. Unsupported x86 ia32/x32 and ARM AArch32 compatibility syscalls are detected and ignored rather than decoded as native calls. Linux 6.1–6.15 uses a `taskstats_exit` kprobe to identify the final thread; newer kernels use the `sched_process_exit` `group_dead` field.
-
-Linux 5.11 and newer normally account BPF allocations with memory cgroups. Older kernels can require a larger `RLIMIT_MEMLOCK` and `CAP_SYS_RESOURCE` to raise its hard limit. Kernel confidentiality lockdown can still deny tracing or kernel reads even with capabilities. Startup errors report the detected UID, relevant effective capabilities, lockdown state, and memory-lock limits.
+The demo uses real eBPF events. It can be reproduced with [`docs/demo.tape`](docs/demo.tape) and [`scripts/demo-workload.sh`](scripts/demo-workload.sh).
 
 ## Install
 
@@ -29,86 +16,60 @@ Linux 5.11 and newer normally account BPF allocations with memory cgroups. Older
 brew install angristan/tap/ncda
 ```
 
-The formula installs both `ncda` and `ncda-bench` from static x86_64 or ARM64 release binaries.
+The formula installs both `ncda` and `ncda-bench` on Linux x86_64 and ARM64.
 
-### Prebuilt release
+### Prebuilt binaries
 
-Linux x86_64 and ARM64 archives, SHA-256 checksums, and build provenance are published on the [GitHub releases page](https://github.com/angristan/ncda/releases).
+Release archives, SHA-256 checksums, and build provenance are available on the [releases page](https://github.com/angristan/ncda/releases).
 
-### Build from source
+## Run
+
+```bash
+sudo ncda                         # interactive TUI
+sudo ncda --stdout                # periodic text summary
+sudo ncda --rate-window 10        # 10-second rolling rates
+sudo ncda --exclude /var/cache    # repeatable path exclusion
+```
+
+Press `?` in the TUI for keybindings and filter syntax. By default, `/proc`, `/sys`, and `/dev` are excluded.
+
+`ncda` reports successful reads and writes that transferred data. Failed calls, zero-byte calls, attribution failures, and capture loss remain visible as diagnostics. Ambiguous paths are placed under `/[unresolved]/` rather than assigned to a plausible but incorrect file.
+
+See [Capture model](docs/capture-model.md) for syscall coverage, path attribution, and loss semantics.
+
+## Requirements
+
+- Linux 6.1 or newer
+- Native x86_64 or AArch64 userspace
+- Root, or `CAP_BPF` + `CAP_PERFMON` (`CAP_SYS_PTRACE` may be needed for path resolution)
+
+The syscall decoder intentionally ignores x86 ia32/x32 and ARM AArch32 compatibility calls. Startup errors include the detected capabilities, kernel lockdown state, and memory-lock limits when eBPF initialization fails.
+
+## Build from source
 
 ```bash
 rustup toolchain install 1.97.1
 rustup toolchain install nightly-2026-08-04 --profile minimal --component rust-src
 cargo install bpf-linker --version 0.11
 cargo build --release --locked --bins
-sudo install -m 0755 target/release/ncda /usr/local/bin/ncda
 ```
 
-The eBPF nightly is pinned because its LLVM 22 bitcode matches `bpf-linker` 0.11. LLVM bitcode is not forward-compatible across major versions.
+The eBPF nightly is pinned because its LLVM version must match `bpf-linker` 0.11.
 
-## Usage
-
-```bash
-ncda --help
-sudo ncda                         # interactive TUI
-sudo ncda --stdout                # periodic text summary
-sudo ncda --rate-window 10        # 10-second rolling rates
-sudo ncda --exclude /var/cache    # repeatable path exclusion
-sudo ncda --verbose
-```
-
-Default exclusions are `/proc`, `/sys`, and `/dev`. Exclusions match complete path components: `/proc` excludes `/proc/1/status`, not `/procfoo`. They apply before container names are added, so host and container paths have the same behavior.
-
-The TUI supports flat and tree views, path/PID/process/container filters, sortable process activity, and a built-in `?` help screen.
-
-## Capture and attribution semantics
-
-`ncda` covers:
-
-- `openat` and `openat2`;
-- `read`, `write`, `pread64`, and `pwrite64`;
-- `readv`, `writev`, `preadv`, `pwritev`, `preadv2`, and `pwritev2`;
-- `dup`, `dup2`, `dup3`, and duplicating `fcntl` commands;
-- `close`, `close_range`, process exec, and process exit.
-
-Byte counts, operation counts, rates, and average syscall latency include only successful operations that transferred at least one byte. Latency is measured in the kernel from syscall entry to syscall exit; it excludes ring delivery and UI processing. Failed completions and successful zero-byte completions are captured separately as `Err` and `Zero` diagnostics.
-
-Path attribution is fail-safe. Descriptor replacement, range close, exec, and final-thread exit invalidate cached state. If a delayed relative open no longer matches the current descriptor target, activity is placed under `/[unresolved]/pid-<pid>/fd-<fd>/` instead of being assigned to a possibly wrong file. Truncated or unreadable kernel path captures are also unresolved. Linux pathname bytes are preserved exactly; invalid UTF-8 and terminal-control bytes are shown with injective `\\xNN` escapes. `Attr` counts attribution failures. Anonymous memory files are grouped under `/[memory]/`; sockets, pipes, and other non-file pseudo descriptors are hidden.
-
-`Drops` reports kernel ring/stash/scratch loss and userspace parse/queue loss. Any new capture loss invalidates all cached descriptor attribution before more events are processed, so stale paths are never reused. The displayed activity is still incomplete. On exit, ncda drains the kernel ring but discards pending aggregation work because output has already closed; verbose logs report that intentional discard count. SIGINT, SIGTERM, output failure, and any critical capture-task failure use the same ordered detach and drain path.
-
-## Benchmarking
-
-`ncda-bench` generates positional file I/O and emits JSON with throughput, exact event/byte recall, syscall latency, delivery latency, capture counters, loss counters, and environment metadata.
-
-```bash
-cargo build --release --locked --bin ncda-bench
-sudo ./target/release/ncda-bench \
-  --warmup-seconds 2 --duration-seconds 30 \
-  --threads 1 --mode mixed --block-size 4096 \
-  --output ncda-benchmark.json
-```
-
-Observed events are restricted to the benchmark PID and measurement timestamps. Kernel capture/drop counters are system-wide measurement deltas. Userspace drop counters cover measurement through final drain. Unrelated host activity can therefore affect global counters even though it cannot affect workload recall. Run on an otherwise idle host, use separate read/write/mixed profiles, repeat each profile at least five times, and reject runs with drops or recall below `1.0`. Latency sample storage is capped at one million events.
-
-## Testing
-
-Unprivileged quality checks:
+## Development
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked --bins
-```
-
-The live-kernel suite validates syscall, descriptor-lifecycle, loss-accounting, and final-drain behavior. It builds without elevation and runs only the test executable through sanitized non-interactive `sudo`:
-
-```bash
 scripts/test-ebpf.sh
 ```
 
+The normal checks are unprivileged. `scripts/test-ebpf.sh` builds as the current user and runs only the integration test executable with `sudo`.
+
+For reproducible capture measurements, see [Benchmarking](docs/benchmarking.md).
+
 ## License
 
-Repository source is licensed under the [MIT License](LICENSE). The eBPF object declares `Dual MIT/GPL` as kernel-loader metadata so GPL-only helpers remain available; this does not change the repository source license.
+[MIT](LICENSE).

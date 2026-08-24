@@ -55,11 +55,11 @@ Normal checks must remain unprivileged. `scripts/test-ebpf.sh` builds as the cur
 
 ## Capture model
 
-Capture covers openat/openat2; scalar, positional, vectored, and v2 read/write calls; dup/dup2/dup3 and duplicating fcntl; close/close_range; exec; and process exit.
+Capture covers openat/openat2; scalar, positional, vectored, and v2 read/write calls; dup/dup2/dup3 and duplicating fcntl; close/close_range; exec; and final process exit.
 
-Entry/exit stashes correlate syscalls by `pid_tgid`. Per-CPU scratch buffers avoid the eBPF stack limit. Kernel and userspace loss counters must remain visible.
+Entry/exit stashes correlate syscalls by `pid_tgid`. Per-CPU scratch buffers avoid the eBPF stack limit. Kernel and userspace loss counters must remain visible, and any new loss must invalidate cached FD attribution.
 
-Path resolution happens in userspace. FD state is invalidated on replacement, range close, exec, and exit. Delayed or ambiguous resolution must fail into `/[unresolved]/pid-<pid>/...`, never a plausible wrong filesystem path. Pseudo descriptors are excluded and memfds use `/[memory]/`.
+Path resolution happens in userspace. FD state is invalidated on replacement, range close, exec, and final process exit. Raw pathname bytes must remain distinct; unsafe display bytes are escaped reversibly. Truncated, unreadable, delayed, or ambiguous paths must fail into `/[unresolved]/pid-<pid>/...`, never a plausible wrong filesystem path. Pseudo descriptors are excluded and memfds use `/[memory]/`.
 
 Only successful positive-byte I/O contributes to bytes, operations, rates, and average syscall latency. Failed and zero-byte completions are diagnostic counters.
 
