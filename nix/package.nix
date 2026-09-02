@@ -25,7 +25,7 @@ rustPlatform.buildRustPackage {
   # Cargo.lock contains Aya git dependencies. fetchCargoVendor turns the full
   # lock into one fixed-output source tree and keeps the nested eBPF build
   # offline as well.
-  cargoHash = lib.fakeHash;
+  cargoHash = "sha256-ZuSjnMB0S/Q6ZFAQ7QgJOGMo/x8S2eDpKNgWGblFRKs=";
 
   nativeBuildInputs = [
     rustupShim

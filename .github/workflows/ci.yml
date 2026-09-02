@@ -92,14 +92,4 @@ jobs:
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
 
       - name: Build and test flake outputs
-        run: nix flake check --print-build-logs
-
-      # The first run produces the lock and reports the ncda dependency hash.
-      # Remove this step once both values are committed.
-      - name: Upload generated flake lock
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: flake-lock-${{ matrix.arch }}
-          path: flake.lock
-          if-no-files-found: error
+        run: nix flake check --no-update-lock-file --print-build-logs
