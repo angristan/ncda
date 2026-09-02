@@ -112,8 +112,10 @@
             ];
           } ''
             rustc --version | grep -F 'rustc 1.97.1 '
-            rustup run nightly-2026-08-04 rustc --version --verbose \
-              | grep -F 'LLVM version: 22.'
+            nightly_version=$(rustup run nightly-2026-08-04 rustc --version --verbose)
+            printf '%s\n' "$nightly_version" \
+              | grep -F 'commit-hash: 504869653f510b279c542e65ccd1ea9710c119ba'
+            printf '%s\n' "$nightly_version" | grep -F 'LLVM version: 22.'
             bpf-linker --version | grep -Fx 'bpf-linker 0.11.0'
             touch "$out"
           '';
