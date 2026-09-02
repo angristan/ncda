@@ -39,7 +39,9 @@ let
 
     registry="$out/source-registry-0"
     test -d "$registry"
+    chmod u+w "$registry"
     for dependency in ${sysrootCargoDeps}/*; do
+      [[ -d "$dependency" ]] || continue
       destination="$registry/$(basename "$dependency")"
       if [[ ! -e "$destination" ]]; then
         ln -s "$dependency" "$destination"
