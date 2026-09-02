@@ -46,11 +46,12 @@ environment.systemPackages = [
 ];
 ```
 
-The flake builds `ncda` and `ncda-bench` from the committed Rust source and
-`Cargo.lock`. It supports native Linux ARM64 and x86_64 builds. The consumer's
-lock file pins ncda's tested Nixpkgs and rust-overlay revisions. Advanced
-configurations can make its Nixpkgs input follow the host after verifying that
-LLVM 22 and the pinned Rust toolchains remain available.
+The flake builds the eBPF object and the `ncda` and `ncda-bench` userspace
+binaries from the committed Rust source and `Cargo.lock`. It supports native
+Linux ARM64 and x86_64 builds. The consumer's lock file pins ncda's tested
+Nixpkgs and rust-overlay revisions. Advanced configurations can make its
+Nixpkgs input follow the host after verifying that LLVM 22 and the pinned Rust
+toolchains remain available.
 
 ### Prebuilt binaries
 
@@ -90,12 +91,20 @@ cargo build --release --locked --bins
 
 The eBPF nightly is pinned because its LLVM version must match `bpf-linker` 0.11.
 
-Nix users can enter a shell containing both pinned Rust toolchains and the
-matching linker:
+The default Nix development shell provides stable Rust, the pinned eBPF
+nightly, and the matching linker. Normal Cargo builds remain source-aware:
 
 ```bash
 nix develop
 cargo build --release --locked --bins
+```
+
+A dedicated shell is also available for building only the eBPF object:
+
+```bash
+nix develop .#ebpf
+cargo build --locked --release --package ncda-ebpf --bin ncda \
+  --target bpfel-unknown-none -Z build-std=core
 ```
 
 ## Development

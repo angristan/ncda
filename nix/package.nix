@@ -1,9 +1,7 @@
 {
-  pkgs,
   lib,
   rustPlatform,
-  rustupShim,
-  bpfLinker,
+  ncdaEbpf,
 }:
 let
   manifest = builtins.fromTOML (builtins.readFile ../Cargo.toml);
@@ -19,44 +17,22 @@ let
       ../ncda-ebpf
     ];
   };
+in
+rustPlatform.buildRustPackage {
+  pname = "ncda";
+  inherit version src;
 
-  workspaceCargoDeps = rustPlatform.importCargoLock {
+  cargoDeps = rustPlatform.importCargoLock {
     lockFile = ../Cargo.lock;
     outputHashes = {
       "aya-0.13.2" = "sha256-zfSKuCeXg23Pkiw0ashRXX91aEuY4MFUfSxOzJ8Y+X8=";
     };
   };
 
-  # `-Z build-std=core` also resolves registry dependencies from rust-src's
-  # lock file. Merge those crates into the normal workspace vendor tree while
-  # preserving the workspace Cargo.lock and Git source configuration. Naming
-  # the result cargo-vendor-dir keeps importCargoLock's relative path valid.
-  sysrootCargoDeps = rustPlatform.importCargoLock {
-    lockFile = ./rust-std-Cargo.lock;
-  };
-  cargoDeps = pkgs.runCommand "cargo-vendor-dir" { } ''
-    mkdir "$out"
-    cp -a ${workspaceCargoDeps}/. "$out/"
-    chmod u+w "$out"
-
-    for dependency in ${sysrootCargoDeps}/*; do
-      [[ -d "$dependency" ]] || continue
-      destination="$out/$(basename "$dependency")"
-      if [[ ! -e "$destination" ]]; then
-        ln -s "$dependency" "$destination"
-      fi
-    done
-    test -e "$out/rustc-literal-escaper-0.0.8"
-  '';
-in
-rustPlatform.buildRustPackage {
-  pname = "ncda";
-  inherit version src cargoDeps;
-
-  nativeBuildInputs = [
-    rustupShim
-    bpfLinker
-  ];
+  NCDA_EBPF_OBJECT = "${ncdaEbpf}/lib/ncda/ncda-ebpf";
+  NCDA_EBPF_TARGET_ARCH = ncdaEbpf.targetArch;
+  NCDA_EBPF_TOOLCHAIN = ncdaEbpf.toolchain;
+  NCDA_BPF_LINKER_VERSION = "bpf-linker ${ncdaEbpf.bpfLinkerVersion}";
 
   cargoBuildFlags = [
     "--package"

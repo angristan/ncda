@@ -44,22 +44,30 @@
           bpfLinker = pkgs.callPackage ./nix/bpf-linker.nix {
             rustPlatform = ebpfRustPlatform;
           };
+          ebpfArch =
+            {
+              aarch64-linux = "aarch64";
+              x86_64-linux = "x86_64";
+            }
+            .${system};
+          ncdaEbpf = pkgs.callPackage ./nix/ebpf.nix {
+            rustPlatform = ebpfRustPlatform;
+            inherit bpfLinker ebpfArch;
+          };
           rustupShim = pkgs.callPackage ./nix/rustup-shim.nix {
             inherit ebpfRust;
           };
           ncda = pkgs.callPackage ./nix/package.nix {
-            inherit
-              bpfLinker
-              rustPlatform
-              rustupShim
-              ;
+            inherit rustPlatform ncdaEbpf;
           };
         in
         {
           inherit
             bpfLinker
+            ebpfArch
             ebpfRust
             ncda
+            ncdaEbpf
             pkgs
             rustupShim
             userspaceRust
@@ -74,6 +82,7 @@
         in
         {
           inherit (context) ncda;
+          ncda-ebpf = context.ncdaEbpf;
           default = context.ncda;
         }
       );
@@ -96,6 +105,7 @@
         in
         {
           package = context.ncda;
+          ebpf = context.ncdaEbpf;
 
           formatting = context.pkgs.runCommand "ncda-formatting" {
             nativeBuildInputs = [ context.userspaceRust ];
@@ -105,14 +115,10 @@
           '';
 
           toolchains = context.pkgs.runCommand "ncda-toolchains" {
-            nativeBuildInputs = [
-              context.bpfLinker
-              context.rustupShim
-              context.userspaceRust
-            ];
+            nativeBuildInputs = [ context.bpfLinker ];
           } ''
-            rustc --version | grep -F 'rustc 1.97.1 '
-            nightly_version=$(rustup run nightly-2026-08-04 rustc --version --verbose)
+            ${context.userspaceRust}/bin/rustc --version | grep -F 'rustc 1.97.1 '
+            nightly_version=$(${context.ebpfRust}/bin/rustc --version --verbose)
             printf '%s\n' "$nightly_version" \
               | grep -F 'commit-hash: 504869653f510b279c542e65ccd1ea9710c119ba'
             printf '%s\n' "$nightly_version" | grep -F 'LLVM version: 22.'
@@ -134,6 +140,14 @@
               context.rustupShim
               context.userspaceRust
             ];
+          };
+
+          ebpf = context.pkgs.mkShell {
+            packages = [
+              context.bpfLinker
+              context.ebpfRust
+            ];
+            CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS = ''--cfg=bpf_target_arch="${context.ebpfArch}" -Cdebuginfo=2 -Clink-arg=--btf'';
           };
         }
       );

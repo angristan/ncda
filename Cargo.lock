@@ -880,6 +880,7 @@ dependencies = [
  "anyhow",
  "aya",
  "aya-build",
+ "aya-obj",
  "cargo_metadata",
  "clap",
  "crossterm",
