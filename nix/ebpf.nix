@@ -84,6 +84,7 @@ rustPlatform.buildRustPackage {
   '';
 
   auditable = false;
+  dontPatchELF = true;
   dontStrip = true;
   doCheck = false;
   doInstallCheck = true;
@@ -91,8 +92,11 @@ rustPlatform.buildRustPackage {
   installCheckPhase = ''
     runHook preInstallCheck
 
+    header=$(llvm-readelf --file-header "$out/lib/ncda/ncda-ebpf")
     sections=$(llvm-readelf --sections "$out/lib/ncda/ncda-ebpf")
-    llvm-readelf --file-header "$out/lib/ncda/ncda-ebpf" | grep -F 'Machine:' | grep -F 'Linux BPF'
+    printf '%s\n' "$header"
+    printf '%s\n' "$sections"
+    printf '%s\n' "$header" | grep -E 'Machine:[[:space:]]+(Linux BPF|EM_BPF)'
     printf '%s\n' "$sections" | grep -F '.BTF'
     printf '%s\n' "$sections" | grep -F '.BTF.ext'
 
