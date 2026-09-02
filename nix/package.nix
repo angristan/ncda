@@ -23,7 +23,7 @@ let
   workspaceCargoDeps = rustPlatform.importCargoLock {
     lockFile = ../Cargo.lock;
     outputHashes = {
-      "aya-0.13.2" = lib.fakeHash;
+      "aya-0.13.2" = "sha256-zfSKuCeXg23Pkiw0ashRXX91aEuY4MFUfSxOzJ8Y+X8=";
     };
   };
 
