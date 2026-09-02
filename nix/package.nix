@@ -37,12 +37,15 @@ let
     cp -a ${workspaceCargoDeps}/. "$out/"
     chmod u+w "$out"
 
+    registry="$out/source-registry-0"
+    test -d "$registry"
     for dependency in ${sysrootCargoDeps}/*; do
-      destination="$out/$(basename "$dependency")"
+      destination="$registry/$(basename "$dependency")"
       if [[ ! -e "$destination" ]]; then
         ln -s "$dependency" "$destination"
       fi
     done
+    test -e "$registry/rustc-literal-escaper-0.0.8"
   '';
 in
 rustPlatform.buildRustPackage {
