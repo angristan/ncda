@@ -35,10 +35,7 @@ nix profile install github:angristan/ncda
 For a declarative NixOS configuration, add ncda as a flake input:
 
 ```nix
-inputs.ncda = {
-  url = "github:angristan/ncda";
-  inputs.nixpkgs.follows = "nixpkgs";
-};
+inputs.ncda.url = "github:angristan/ncda";
 ```
 
 Then include its package where `inputs` is available:
@@ -50,7 +47,10 @@ environment.systemPackages = [
 ```
 
 The flake builds `ncda` and `ncda-bench` from the committed Rust source and
-`Cargo.lock`. It supports native Linux ARM64 and x86_64 builds.
+`Cargo.lock`. It supports native Linux ARM64 and x86_64 builds. The consumer's
+lock file pins ncda's tested Nixpkgs and rust-overlay revisions. Advanced
+configurations can make its Nixpkgs input follow the host after verifying that
+LLVM 22 and the pinned Rust toolchains remain available.
 
 ### Prebuilt binaries
 

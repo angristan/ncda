@@ -18,11 +18,12 @@ Aya invokes nested eBPF builds through `rustup run`. `rustup-shim.nix` implement
 only that interface and dispatches to the immutable nightly toolchain. It does
 not install or update toolchains.
 
-`package.nix` vendors the workspace dependency graph and the registry crates
+`package.nix` imports the workspace dependency graph and the registry crates
 from rust-src's own lock file. `rust-std-Cargo.lock` is copied from the Rust
-commit behind `nightly-2026-08-04` and must move with that pin. This also
-includes the Aya Git revision locked in the workspace `Cargo.lock`; neither the
-userspace nor nested eBPF build accesses the network.
+commit behind `nightly-2026-08-04` and must move with that pin. The Aya Git
+revision has an explicit output hash. Workspace-only version changes therefore
+do not invalidate dependency hashes, and neither the userspace nor nested eBPF
+build accesses the network.
 
 Validate changes on both supported architectures:
 

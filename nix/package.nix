@@ -20,34 +20,33 @@ let
     ];
   };
 
-  workspaceCargoDeps = rustPlatform.fetchCargoVendor {
-    name = "ncda-${version}-cargo-deps";
-    inherit src;
-    hash = "sha256-ZuSjnMB0S/Q6ZFAQ7QgJOGMo/x8S2eDpKNgWGblFRKs=";
+  workspaceCargoDeps = rustPlatform.importCargoLock {
+    lockFile = ../Cargo.lock;
+    outputHashes = {
+      "aya-0.13.2" = lib.fakeHash;
+    };
   };
 
   # `-Z build-std=core` also resolves registry dependencies from rust-src's
   # lock file. Merge those crates into the normal workspace vendor tree while
-  # preserving the workspace Cargo.lock and generated Cargo configuration.
+  # preserving the workspace Cargo.lock and Git source configuration. Naming
+  # the result cargo-vendor-dir keeps importCargoLock's relative path valid.
   sysrootCargoDeps = rustPlatform.importCargoLock {
     lockFile = ./rust-std-Cargo.lock;
   };
-  cargoDeps = pkgs.runCommand "ncda-${version}-cargo-deps-with-sysroot" { } ''
+  cargoDeps = pkgs.runCommand "cargo-vendor-dir" { } ''
     mkdir "$out"
     cp -a ${workspaceCargoDeps}/. "$out/"
     chmod u+w "$out"
 
-    registry="$out/source-registry-0"
-    test -d "$registry"
-    chmod u+w "$registry"
     for dependency in ${sysrootCargoDeps}/*; do
       [[ -d "$dependency" ]] || continue
-      destination="$registry/$(basename "$dependency")"
+      destination="$out/$(basename "$dependency")"
       if [[ ! -e "$destination" ]]; then
         ln -s "$dependency" "$destination"
       fi
     done
-    test -e "$registry/rustc-literal-escaper-0.0.8"
+    test -e "$out/rustc-literal-escaper-0.0.8"
   '';
 in
 rustPlatform.buildRustPackage {
