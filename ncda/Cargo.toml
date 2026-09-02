@@ -36,6 +36,7 @@ unicode-width = "0.2"
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
+aya-obj = { workspace = true }
 cargo_metadata = { workspace = true }
 
 [[bin]]

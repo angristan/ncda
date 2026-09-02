@@ -18,6 +18,41 @@ brew install angristan/tap/ncda
 
 The formula installs both `ncda` and `ncda-bench` on Linux x86_64 and ARM64.
 
+### Nix
+
+Run the source-built package without installing it:
+
+```bash
+nix run github:angristan/ncda -- --version
+```
+
+Install it into a user profile:
+
+```bash
+nix profile install github:angristan/ncda
+```
+
+For a declarative NixOS configuration, add ncda as a flake input:
+
+```nix
+inputs.ncda.url = "github:angristan/ncda";
+```
+
+Then include its package where `inputs` is available:
+
+```nix
+environment.systemPackages = [
+  inputs.ncda.packages.${pkgs.system}.default
+];
+```
+
+The flake builds the eBPF object and the `ncda` and `ncda-bench` userspace
+binaries from the committed Rust source and `Cargo.lock`. It supports native
+Linux ARM64 and x86_64 builds. The consumer's lock file pins ncda's tested
+Nixpkgs and rust-overlay revisions. Advanced configurations can make its
+Nixpkgs input follow the host after verifying that LLVM 22 and the pinned Rust
+toolchains remain available.
+
 ### Prebuilt binaries
 
 Release archives, SHA-256 checksums, and build provenance are available on the [releases page](https://github.com/angristan/ncda/releases).
@@ -56,6 +91,22 @@ cargo build --release --locked --bins
 
 The eBPF nightly is pinned because its LLVM version must match `bpf-linker` 0.11.
 
+The default Nix development shell provides stable Rust, the pinned eBPF
+nightly, and the matching linker. Normal Cargo builds remain source-aware:
+
+```bash
+nix develop
+cargo build --release --locked --bins
+```
+
+A dedicated shell is also available for building only the eBPF object:
+
+```bash
+nix develop .#ebpf
+cargo build --locked --release --package ncda-ebpf --bin ncda \
+  --target bpfel-unknown-none -Z build-std=core
+```
+
 ## Development
 
 ```bash
@@ -63,10 +114,11 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked --bins
+nix flake check --no-update-lock-file
 scripts/test-ebpf.sh
 ```
 
-The normal checks are unprivileged. `scripts/test-ebpf.sh` builds as the current user and runs only the integration test executable with `sudo`.
+The normal checks are unprivileged. `scripts/test-ebpf.sh` builds as the current user and runs only the integration test executable with `sudo`. Nix checks build and smoke-test both binaries, verify formatting, and assert the pinned Rust, LLVM, and linker versions. They do not run privileged live eBPF tests.
 
 For reproducible capture measurements, see [Benchmarking](docs/benchmarking.md).
 
