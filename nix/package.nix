@@ -1,4 +1,5 @@
 {
+  pkgs,
   lib,
   rustPlatform,
   rustupShim,
@@ -6,9 +7,6 @@
 }:
 let
   manifest = builtins.fromTOML (builtins.readFile ../Cargo.toml);
-in
-rustPlatform.buildRustPackage {
-  pname = "ncda";
   inherit (manifest.workspace.package) version;
 
   src = lib.fileset.toSource {
@@ -22,10 +20,34 @@ rustPlatform.buildRustPackage {
     ];
   };
 
-  # Cargo.lock contains Aya git dependencies. fetchCargoVendor turns the full
-  # lock into one fixed-output source tree and keeps the nested eBPF build
-  # offline as well.
-  cargoHash = "sha256-ZuSjnMB0S/Q6ZFAQ7QgJOGMo/x8S2eDpKNgWGblFRKs=";
+  workspaceCargoDeps = rustPlatform.fetchCargoVendor {
+    name = "ncda-${version}-cargo-deps";
+    inherit src;
+    hash = "sha256-ZuSjnMB0S/Q6ZFAQ7QgJOGMo/x8S2eDpKNgWGblFRKs=";
+  };
+
+  # `-Z build-std=core` also resolves registry dependencies from rust-src's
+  # lock file. Merge those crates into the normal workspace vendor tree while
+  # preserving the workspace Cargo.lock and generated Cargo configuration.
+  sysrootCargoDeps = rustPlatform.importCargoLock {
+    lockFile = ./rust-std-Cargo.lock;
+  };
+  cargoDeps = pkgs.runCommand "ncda-${version}-cargo-deps-with-sysroot" { } ''
+    mkdir "$out"
+    cp -a ${workspaceCargoDeps}/. "$out/"
+    chmod u+w "$out"
+
+    for dependency in ${sysrootCargoDeps}/*; do
+      destination="$out/$(basename "$dependency")"
+      if [[ ! -e "$destination" ]]; then
+        ln -s "$dependency" "$destination"
+      fi
+    done
+  '';
+in
+rustPlatform.buildRustPackage {
+  pname = "ncda";
+  inherit version src cargoDeps;
 
   nativeBuildInputs = [
     rustupShim
