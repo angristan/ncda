@@ -4,7 +4,7 @@ members = ["ncda", "ncda-common", "ncda-ebpf"]
 default-members = ["ncda", "ncda-common"]
 
 [workspace.package]
-version = "1.0.4"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.97.1"
 license = "MIT"

@@ -1,5 +1,12 @@
 # Changelog
 
+# [1.1.0](https://github.com/angristan/ncda/compare/v1.0.4...v1.1.0) (2026-09-02)
+
+
+### Features
+
+* add first-class Nix package ([#1](https://github.com/angristan/ncda/issues/1)) ([c4c7422](https://github.com/angristan/ncda/commit/c4c742276f7df3c0b25253c5404f1d50b45bdd2e))
+
 ## [1.0.4](https://github.com/angristan/ncda/compare/v1.0.3...v1.0.4) — 2026-08-22
 
 - Corrected descriptor lifecycle handling, compatibility syscall filtering, and final-thread process cleanup.
