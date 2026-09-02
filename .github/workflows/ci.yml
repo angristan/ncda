@@ -69,3 +69,37 @@ jobs:
       - name: Run live eBPF integration suite
         if: github.event_name != 'pull_request'
         run: scripts/test-ebpf.sh
+
+  nix:
+    name: ${{ matrix.arch }} Nix package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+
+      - name: Build and test flake outputs
+        run: nix flake check --print-build-logs
+
+      # The first run produces the lock and reports the ncda dependency hash.
+      # Remove this step once both values are committed.
+      - name: Upload generated flake lock
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: flake-lock-${{ matrix.arch }}
+          path: flake.lock
+          if-no-files-found: error
