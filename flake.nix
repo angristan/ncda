@@ -29,7 +29,9 @@
             inherit system;
             overlays = [ rust-overlay.overlays.default ];
           };
-          userspaceRust = pkgs.rust-bin.stable."1.97.1".default;
+          userspaceRust = pkgs.rust-bin.stable."1.97.1".default.override {
+            extensions = [ "rust-src" ];
+          };
           ebpfRust = pkgs.rust-bin.nightly."2026-08-04".minimal.override {
             extensions = [ "rust-src" ];
           };
