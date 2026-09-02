@@ -29,9 +29,7 @@
             inherit system;
             overlays = [ rust-overlay.overlays.default ];
           };
-          userspaceRust = pkgs.rust-bin.stable."1.97.1".default.override {
-            extensions = [ "rust-src" ];
-          };
+          userspaceRust = pkgs.rust-bin.stable."1.97.1".default;
           ebpfRust = pkgs.rust-bin.nightly."2026-08-04".minimal.override {
             extensions = [ "rust-src" ];
           };
@@ -39,8 +37,12 @@
             cargo = userspaceRust;
             rustc = userspaceRust;
           };
+          ebpfRustPlatform = pkgs.makeRustPlatform {
+            cargo = ebpfRust;
+            rustc = ebpfRust;
+          };
           bpfLinker = pkgs.callPackage ./nix/bpf-linker.nix {
-            inherit rustPlatform;
+            rustPlatform = ebpfRustPlatform;
           };
           rustupShim = pkgs.callPackage ./nix/rustup-shim.nix {
             inherit ebpfRust;
